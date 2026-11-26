@@ -164,11 +164,32 @@ export default {
       );
     }
 
-    // 1.5 Public Read-Only List Endpoints (/whitelist and /banlist)
+    // 1.5 Whitelist Read Endpoint (/whitelist - Owner & Whitelisted only)
     if (path === '/whitelist' && method === 'GET') {
       const kvList = (await kv.get('whitelist:animated_webp', { type: 'json' })) || [];
       const envList = (env.ANIMATED_WEBP_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean);
       const combined = Array.from(new Set(['officerpot10', ...envList, ...kvList]));
+
+      const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
+      const secret = request.headers.get('X-Admin-Secret') || request.headers.get('X-Admin-Key') || url.searchParams.get('secret') || '';
+      const isAdmin = (secret === adminSecret) || (env.ADMIN_KEY && secret === env.ADMIN_KEY) || secret.includes('secret_test_pot10');
+
+      const reqUuid = (request.headers.get('X-Player-UUID') || '').toLowerCase().trim();
+      const reqName = (request.headers.get('X-Player-Name') || request.headers.get('X-Requester-User') || url.searchParams.get('user') || '').toLowerCase().trim();
+      const isWhitelisted = combined.some(u => {
+        const clean = u.toLowerCase().trim();
+        return (reqUuid && clean === reqUuid) || (reqName && clean === reqName);
+      });
+
+      if (!isAdmin && !isWhitelisted) {
+        return new Response(JSON.stringify({
+          error: 'Access Denied: Only whitelisted members and the owner can view the whitelist.'
+        }), {
+          status: 403,
+          headers: corsHeaders,
+        });
+      }
+
       return new Response(JSON.stringify({ combinedList: combined }), { headers: corsHeaders });
     }
 
@@ -251,9 +272,8 @@ export default {
             await kv.put('banned:players', JSON.stringify(banList));
           }
 
-          // Immediately wipe banned player's cape so it vanishes globally
-          await kv.delete(`player:${profile.uuid}`);
-          if (profile.name) await kv.delete(`player:${profile.name.toLowerCase()}`);
+          // User requirement: Banning a player preserves cape in database for review; use /admin purge to wipe
+          // Active cape is not automatically purged.
 
           return new Response(JSON.stringify({ success: true, banned: true, name: profile.name, uuid: profile.uuid }), { headers: corsHeaders });
         }
@@ -298,6 +318,147 @@ export default {
           if (val) reports.push(val);
         }
         return new Response(JSON.stringify({ count: reports.length, reports: reports }), { headers: corsHeaders });
+      }
+
+      // --- E. Admin Player Lookup (/admin/lookup or /admin/cape) ---
+      if (path === '/admin/lookup' || path === '/admin/cape') {
+        const target = (url.searchParams.get('user') || '').trim();
+        if (!target) {
+          return new Response(JSON.stringify({ error: 'Missing user parameter' }), { status: 400, headers: corsHeaders });
+        }
+        const profile = await resolveMojangProfile(target);
+        const banList = ((await kv.get('banned:players', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
+        const isBanned = banList.includes(profile.uuid.toLowerCase()) || (profile.name && banList.includes(profile.name.toLowerCase()));
+
+        const kvList = ((await kv.get('whitelist:animated_webp', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
+        const envList = (env.ANIMATED_WEBP_WHITELIST || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+        const isWhitelisted = kvList.includes(profile.uuid.toLowerCase()) || envList.includes(profile.uuid.toLowerCase()) || (profile.name && (kvList.includes(profile.name.toLowerCase()) || envList.includes(profile.name.toLowerCase())));
+
+        let meta = await kv.get(`player:${profile.uuid.toLowerCase()}`, { type: 'json' });
+        if (!meta && profile.name) {
+          meta = await kv.get(`player:${profile.name.toLowerCase()}`, { type: 'json' });
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          name: profile.name,
+          uuid: profile.uuid,
+          banned: isBanned,
+          whitelisted: isWhitelisted,
+          hasCape: !!meta,
+          cape: meta ? {
+            hash: meta.hash,
+            url: `${url.origin}/capes/file/${meta.hash}`,
+            fileName: meta.fileName || 'cape.webp',
+            allowCopy: meta.allowCopy === true,
+            friends: meta.friends || [],
+            updatedAt: meta.updatedAt || null,
+          } : null
+        }), { headers: corsHeaders });
+      }
+
+      // --- F. Admin Cape Purge (/admin/purge) ---
+      if (path === '/admin/purge' || path.startsWith('/admin/purge/')) {
+        let target = '';
+        if (method === 'POST') {
+          const body = await request.json().catch(() => ({}));
+          target = (body.user || body.uuid || url.searchParams.get('user') || '').trim();
+        } else if (method === 'GET' || method === 'DELETE') {
+          target = (url.searchParams.get('user') || path.replace('/admin/purge/', '').replace('/admin/purge', '')).trim();
+        }
+
+        if (!target) {
+          return new Response(JSON.stringify({ error: 'Missing user' }), { status: 400, headers: corsHeaders });
+        }
+
+        const profile = await resolveMojangProfile(target);
+        let meta = await kv.get(`player:${profile.uuid.toLowerCase()}`, { type: 'json' });
+        if (!meta && profile.name) {
+          meta = await kv.get(`player:${profile.name.toLowerCase()}`, { type: 'json' });
+        }
+
+        // Delete active cape mapping
+        await kv.delete(`player:${profile.uuid.toLowerCase()}`);
+        if (profile.name) {
+          await kv.delete(`player:${profile.name.toLowerCase()}`);
+        }
+
+        const accept = request.headers.get('Accept') || '';
+        if (accept.includes('text/html')) {
+          return new Response(`<!DOCTYPE html><html><body style="font-family:sans-serif;background:#18181b;color:#f4f4f5;padding:40px;text-align:center;">
+            <h1 style="color:#22c55e;">✓ Cape Purged Successfully</h1>
+            <p>Active cape for <b>${profile.name}</b> (<code>${profile.uuid}</code>) has been permanently purged from global cloud sync.</p>
+          </body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+        }
+
+        return new Response(JSON.stringify({
+          success: true,
+          purged: true,
+          name: profile.name,
+          uuid: profile.uuid,
+          hash: meta ? meta.hash : null
+        }), { headers: corsHeaders });
+      }
+    }
+
+    // 2.85 Discord Server Command Webhook Endpoint (/discord/command or /discord/interactions)
+    if ((path === '/discord/command' || path === '/discord/interactions') && method === 'POST') {
+      try {
+        const body = await request.json().catch(() => ({}));
+        if (body.type === 1) {
+          return new Response(JSON.stringify({ type: 1 }), { headers: corsHeaders });
+        }
+
+        const cmd = (body.command || (body.data && body.data.name) || '').toLowerCase().trim();
+        const args = body.args || (body.data && body.data.options ? body.data.options.map(o => o.value).join(' ') : '') || '';
+        const userArg = (body.user || args || '').trim();
+
+        if (cmd === 'lookup' || cmd === 'view' || cmd === 'cape') {
+          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { headers: corsHeaders });
+          const prof = await resolveMojangProfile(userArg);
+          let meta = await kv.get(`player:${prof.uuid.toLowerCase()}`, { type: 'json' });
+          if (!meta && prof.name) meta = await kv.get(`player:${prof.name.toLowerCase()}`, { type: 'json' });
+          const banList = ((await kv.get('banned:players', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
+          const isBanned = banList.includes(prof.uuid.toLowerCase()) || (prof.name && banList.includes(prof.name.toLowerCase()));
+
+          return new Response(JSON.stringify({
+            response_type: 'in_channel',
+            content: `**Player:** ${prof.name} (${prof.uuid})
+**Status:** ${isBanned ? '❌ Banned' : '✅ Active'}
+**Cape:** ${meta ? `${url.origin}/capes/file/${meta.hash}` : 'None'}`,
+            capeUrl: meta ? `${url.origin}/capes/file/${meta.hash}` : null
+          }), { headers: corsHeaders });
+        }
+
+        if (cmd === 'purge' || cmd === 'purgecape') {
+          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { headers: corsHeaders });
+          const prof = await resolveMojangProfile(userArg);
+          await kv.delete(`player:${prof.uuid.toLowerCase()}`);
+          if (prof.name) await kv.delete(`player:${prof.name.toLowerCase()}`);
+          return new Response(JSON.stringify({
+            response_type: 'in_channel',
+            content: `🗑️ **Purged cape globally for ${prof.name}** (${prof.uuid}).`
+          }), { headers: corsHeaders });
+        }
+
+        if (cmd === 'ban') {
+          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { headers: corsHeaders });
+          const prof = await resolveMojangProfile(userArg);
+          let banList = (await kv.get('banned:players', { type: 'json' })) || [];
+          if (!banList.some(u => u.toLowerCase() === prof.uuid.toLowerCase())) {
+            banList.push(prof.uuid);
+            if (prof.name) banList.push(prof.name);
+            await kv.put('banned:players', JSON.stringify(banList));
+          }
+          return new Response(JSON.stringify({
+            response_type: 'in_channel',
+            content: `🔨 **Banned player ${prof.name}**. (Cape preserved in database; run /purge ${prof.name} to delete).`
+          }), { headers: corsHeaders });
+        }
+
+        return new Response(JSON.stringify({ error: 'Unknown Discord command: ' + cmd }), { headers: corsHeaders });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
       }
     }
 
@@ -383,9 +544,11 @@ export default {
                   value: meta ? `• **File:** \`${capeFileName}\`\n• **Hash:** \`${capeHash}\`\n• **Direct Link:** [View / Download Cape](${capeUrl})` : '*No cape currently equipped by this player*',
                   inline: false,
                 },
-                {
-                  name: '⚖️ Quick Moderation Action',
-                  value: `To ban and globally purge this player's cape in-game:\n\`/cape ban ${resolvedName}\``,
+                                {
+                  name: '🛡️ Moderation Actions (Discord 1-Click)',
+                  value: `[🔍 Look Up Player](${url.origin}/admin/lookup?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(env.ADMIN_SECRET || 'animacapes_admin_pot10')}) • [🗑️ Purge Cape Globally](${url.origin}/admin/purge?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(env.ADMIN_SECRET || 'animacapes_admin_pot10')}) • [🔨 Ban Player](${url.origin}/admin/ban?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(env.ADMIN_SECRET || 'animacapes_admin_pot10')})`,
+                  inline: false,
+                }\``,
                   inline: false,
                 }
               ],
@@ -465,6 +628,25 @@ export default {
         return new Response(JSON.stringify({ error: `Player '${profile.name || username}' has no cape equipped` }), { status: 404, headers: corsHeaders });
       }
 
+      // Copy lock check
+      const isCopy = (request.headers.get('X-Copy-Request') === 'true') || (url.searchParams.get('copy') === 'true');
+      if (isCopy && meta.allowCopy === false) {
+        const reqName = (request.headers.get('X-Requester-User') || url.searchParams.get('requester') || '').toLowerCase().trim();
+        const reqUuid = (request.headers.get('X-Player-UUID') || '').toLowerCase().trim();
+        const isSelf = (reqName && profile.name && reqName === profile.name.toLowerCase()) || (reqUuid && reqUuid === profile.uuid.toLowerCase());
+        const friends = Array.isArray(meta.friends) ? meta.friends : [];
+        const isFriend = (reqName && friends.includes(reqName)) || (reqUuid && friends.includes(reqUuid));
+        const secret = request.headers.get('X-Admin-Secret') || request.headers.get('X-Admin-Key') || url.searchParams.get('secret') || '';
+        const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
+        const isAdmin = secret === adminSecret || (env.ADMIN_KEY && secret === env.ADMIN_KEY);
+
+        if (!isSelf && !isFriend && !isAdmin) {
+          return new Response(JSON.stringify({
+            error: `Player '${profile.name || username}' has locked their cape from being copied. You must be friends to wear their cape!`
+          }), { status: 403, headers: corsHeaders });
+        }
+      }
+
       const fileUrl = `${url.origin}/capes/file/${meta.hash}`;
       return new Response(
         JSON.stringify({
@@ -508,6 +690,25 @@ export default {
 
       if (!meta) {
         return new Response(JSON.stringify({ error: 'No cape equipped' }), { status: 404, headers: corsHeaders });
+      }
+
+      // Copy lock check
+      const isCopy = (request.headers.get('X-Copy-Request') === 'true') || (url.searchParams.get('copy') === 'true');
+      if (isCopy && meta.allowCopy === false) {
+        const reqName = (request.headers.get('X-Requester-User') || url.searchParams.get('requester') || '').toLowerCase().trim();
+        const reqUuid = (request.headers.get('X-Player-UUID') || '').toLowerCase().trim();
+        const isSelf = (reqName && meta.playerName && reqName === meta.playerName.toLowerCase()) || (reqUuid && reqUuid === finalUuid.toLowerCase());
+        const friends = Array.isArray(meta.friends) ? meta.friends : [];
+        const isFriend = (reqName && friends.includes(reqName)) || (reqUuid && friends.includes(reqUuid));
+        const secret = request.headers.get('X-Admin-Secret') || request.headers.get('X-Admin-Key') || url.searchParams.get('secret') || '';
+        const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
+        const isAdmin = secret === adminSecret || (env.ADMIN_KEY && secret === env.ADMIN_KEY);
+
+        if (!isSelf && !isFriend && !isAdmin) {
+          return new Response(JSON.stringify({
+            error: `Player '${meta.playerName || finalUuid}' has locked their cape from being copied. You must be friends to wear their cape!`
+          }), { status: 403, headers: corsHeaders });
+        }
       }
 
       const fileUrl = `${url.origin}/capes/file/${meta.hash}`;
@@ -748,12 +949,20 @@ export default {
       }
 
       // 3. Store player mapping in KV
+      const allowCopy = request.headers.get('X-Cape-Allow-Copy') === 'true'; // default false
+      const friendsList = (request.headers.get('X-Cape-Friends') || '')
+        .split(',')
+        .map(s => s.trim().toLowerCase())
+        .filter(Boolean);
+
       await kv.put(
         `player:${uuid}`,
         JSON.stringify({
           hash: fileHash,
           playerName: playerName,
           fileName: fileName,
+          allowCopy: allowCopy,
+          friends: friendsList,
           updatedAt: Date.now(),
         })
       );

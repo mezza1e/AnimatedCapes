@@ -55,23 +55,41 @@ public class CapeShareService {
 
                 if (callback != null) callback.accept("§7[Animated Capes] Searching for " + cleanTarget + "'s cape...");
 
-                // 1. Query cape metadata: try /capes/by-name/<target> first
-                String queryUrl = backend + "/capes/by-name/" + URLEncoder.encode(cleanTarget, StandardCharsets.UTF_8);
+                String requesterName = "Anonymous";
+                String requesterUuid = "";
+                try {
+                    Minecraft mc = Minecraft.getInstance();
+                    if (mc != null && mc.getUser() != null) {
+                        requesterName = mc.getUser().getName();
+                        if (mc.getUser().getProfileId() != null) {
+                            requesterUuid = mc.getUser().getProfileId().toString();
+                        }
+                    }
+                } catch (Throwable ignored) {}
+
+                // 1. Query cape metadata: try /capes/by-name/<target>?copy=true first
+                String queryUrl = backend + "/capes/by-name/" + URLEncoder.encode(cleanTarget, StandardCharsets.UTF_8) + "?copy=true";
                 HttpRequest req = HttpRequest.newBuilder()
                         .uri(URI.create(queryUrl))
                         .timeout(Duration.ofSeconds(10))
                         .header("User-Agent", "AnimatedCapes-Mod/1.0.0")
+                        .header("X-Copy-Request", "true")
+                        .header("X-Requester-User", requesterName)
+                        .header("X-Player-UUID", requesterUuid)
                         .GET()
                         .build();
 
                 HttpResponse<String> resp = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 404) {
-                    // Try direct /capes/<target> in case it's a UUID
-                    queryUrl = backend + "/capes/" + URLEncoder.encode(cleanTarget, StandardCharsets.UTF_8);
+                    // Try direct /capes/<target>?copy=true in case it's a UUID
+                    queryUrl = backend + "/capes/" + URLEncoder.encode(cleanTarget, StandardCharsets.UTF_8) + "?copy=true";
                     req = HttpRequest.newBuilder()
                             .uri(URI.create(queryUrl))
                             .timeout(Duration.ofSeconds(10))
                             .header("User-Agent", "AnimatedCapes-Mod/1.0.0")
+                            .header("X-Copy-Request", "true")
+                            .header("X-Requester-User", requesterName)
+                            .header("X-Player-UUID", requesterUuid)
                             .GET()
                             .build();
                     resp = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());

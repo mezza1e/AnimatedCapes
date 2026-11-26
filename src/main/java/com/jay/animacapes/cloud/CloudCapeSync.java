@@ -178,6 +178,8 @@ public class CloudCapeSync {
                         .header("X-Player-Name", username)
                         .header("X-Cape-Hash", actualHash)
                         .header("X-File-Name", fileToUpload.getName())
+                        .header("X-Cape-Allow-Copy", String.valueOf(AnimaCapesConfig.getInstance().allowCapeCopy))
+                        .header("X-Cape-Friends", String.join(",", AnimaCapesConfig.getInstance().getFriends()))
                         .POST(HttpRequest.BodyPublishers.ofByteArray(fileBytes));
 
                 String adminKey = AnimaCapesConfig.getInstance().adminKey;
@@ -205,6 +207,8 @@ public class CloudCapeSync {
                             .header("X-Player-Name", username)
                             .header("X-Cape-Hash", gifHash)
                             .header("X-File-Name", originalGif.getName())
+                            .header("X-Cape-Allow-Copy", String.valueOf(AnimaCapesConfig.getInstance().allowCapeCopy))
+                            .header("X-Cape-Friends", String.join(",", AnimaCapesConfig.getInstance().getFriends()))
                             .POST(HttpRequest.BodyPublishers.ofByteArray(gifBytes));
 
                     if (adminKey != null && !adminKey.trim().isEmpty()) {

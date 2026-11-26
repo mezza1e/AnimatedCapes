@@ -25,6 +25,50 @@ public class AnimaCapesConfig {
     public String adminKey = "";
     public float animationSpeed = 1.0f; // 0.25f to 3.0f, default 1.0f
     public java.util.List<String> blockedUsers = new java.util.ArrayList<>();
+    public boolean allowCapeCopy = false; // Locked by default (players cannot copy other players' capes)
+    public java.util.List<String> friends = new java.util.ArrayList<>();
+
+    public boolean isAdmin() {
+        return adminKey != null && !adminKey.trim().isEmpty();
+    }
+
+    public boolean isFriend(String nameOrUuid) {
+        if (nameOrUuid == null || friends == null || friends.isEmpty()) return false;
+        String clean = nameOrUuid.trim().toLowerCase();
+        for (String f : friends) {
+            if (f != null && f.trim().equalsIgnoreCase(clean)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean addFriend(String nameOrUuid) {
+        if (nameOrUuid == null || nameOrUuid.trim().isEmpty()) return false;
+        if (friends == null) friends = new java.util.ArrayList<>();
+        String clean = nameOrUuid.trim();
+        if (!isFriend(clean)) {
+            friends.add(clean);
+            save();
+            return true;
+        }
+        return false;
+    }
+
+    public boolean removeFriend(String nameOrUuid) {
+        if (nameOrUuid == null || friends == null || friends.isEmpty()) return false;
+        String clean = nameOrUuid.trim().toLowerCase();
+        boolean removed = friends.removeIf(f -> f != null && f.trim().equalsIgnoreCase(clean));
+        if (removed) {
+            save();
+        }
+        return removed;
+    }
+
+    public java.util.List<String> getFriends() {
+        if (friends == null) friends = new java.util.ArrayList<>();
+        return new java.util.ArrayList<>(friends);
+    }
 
     public boolean isBlocked(String uuidOrName) {
         if (uuidOrName == null || blockedUsers == null || blockedUsers.isEmpty()) return false;
@@ -107,6 +151,9 @@ public class AnimaCapesConfig {
                 if (config != null) {
                     if (config.blockedUsers == null) {
                         config.blockedUsers = new java.util.ArrayList<>();
+                    }
+                    if (config.friends == null) {
+                        config.friends = new java.util.ArrayList<>();
                     }
                     if (config.backendUrl == null || config.backendUrl.trim().isEmpty() || config.backendUrl.contains("localhost") || config.backendUrl.contains("fly.dev")) {
                         config.backendUrl = "https://animated-capes.officerpot10.workers.dev";
