@@ -1,0 +1,46 @@
+name: Build & Verify Mod
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  release:
+    types: [ published ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'microsoft'
+
+      - name: Build Mod with Gradle
+        run: .\gradlew.bat build --no-daemon
+
+      - name: Run Stress & Safety Verification Tests
+        run: .\gradlew.bat runStressTests runDialogAndSyncTests --no-daemon
+
+      - name: Generate SHA-256 Checksums
+        shell: pwsh
+        run: |
+          Get-FileHash build\libs\*.jar -Algorithm SHA256 | Format-Table Hash, Path -AutoSize | Out-String | Tee-Object -FilePath SHA256SUMS.txt
+
+      - name: Upload Verifiable Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnimatedCapes-26.2-CI-Build
+          path: |
+            build/libs/*.jar
+            SHA256SUMS.txt

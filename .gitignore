@@ -1,0 +1,27 @@
+# Gradle & Java build outputs
+/.gradle/
+/build/
+/out/
+/bin/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+SHA256SUMS.txt
+
+# Local backend runtime database & uploaded files
+/backend/data/files/
+/backend/data/*.json
+
+# Local runtime tools, logs & test dirs
+/tools/*.exe
+/animacapes/
+/logs/
+/run/
+/config/
+
+# IDE & OS files
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
