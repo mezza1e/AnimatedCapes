@@ -25,6 +25,7 @@ public class AnimaCapesScreen extends Screen {
     private Button fitModeButton;
     private Button prevCapeBtn;
     private Button nextCapeBtn;
+    private long limitWarningTimer = 0;
 
     private int prevX = 0;
     private int prevY = 0;
@@ -46,6 +47,10 @@ public class AnimaCapesScreen extends Screen {
 
         // 1. Choose File Button
         this.addRenderableWidget(Button.builder(Component.literal("Choose Animation (WebP / GIF)..."), b -> {
+            if (!GalleryFolder.isBypassLimit() && GalleryFolder.listCapeFiles().size() >= GalleryFolder.MAX_GALLERY_CAPES) {
+                limitWarningTimer = System.currentTimeMillis() + 4000;
+                return;
+            }
             FileDialogHelper.openImageFileChooserAsync(chosen -> {
                 if (chosen == null) return;
                 if (!com.jay.animacapes.codec.AnimationDecoder.isSupportedFormat(chosen.getName())) {
@@ -227,7 +232,11 @@ public class AnimaCapesScreen extends Screen {
 
         // Title
         extractor.centeredText(this.font, Component.literal("§lAnimated Capes Manager"), centerX, 14, 0xFFFFFFFF);
-        extractor.centeredText(this.font, Component.literal("§7Upload animated stickers or pick from your cape gallery"), centerX, 26, 0xFFAAAAAA);
+        if (limitWarningTimer > System.currentTimeMillis()) {
+            extractor.centeredText(this.font, Component.literal("§c⚠ Gallery Full (30/30 capes)! Delete a cape before adding more."), centerX, 26, 0xFFFF5555);
+        } else {
+            extractor.centeredText(this.font, Component.literal("§7Upload animated stickers or pick from your cape gallery"), centerX, 26, 0xFFAAAAAA);
+        }
 
         // Status Card
         int cardY = 162;

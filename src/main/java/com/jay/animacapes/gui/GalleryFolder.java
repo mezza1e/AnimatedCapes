@@ -14,7 +14,13 @@ import java.util.Locale;
 
 public class GalleryFolder {
     public static final String FOLDER_NAME = "animacapes";
+    public static final int MAX_GALLERY_CAPES = 30;
     private static final java.util.Map<String, Boolean> APNG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
+
+    public static boolean isBypassLimit() {
+        String key = AnimaCapesConfig.getInstance().adminKey;
+        return key != null && !key.trim().isEmpty();
+    }
 
     public static File getFolder() {
         File baseDir = null;
@@ -128,6 +134,13 @@ public class GalleryFolder {
 
         if (source.getParentFile() != null && source.getParentFile().getAbsolutePath().equalsIgnoreCase(galleryDir.getAbsolutePath())) {
             return source;
+        }
+
+        // Hard limit: Max 30 capes allowed to prevent disk spam (Whitelisted/Admin bypasses)
+        List<File> currentFiles = listCapeFiles();
+        if (!isBypassLimit() && currentFiles.size() >= MAX_GALLERY_CAPES && !dest.exists()) {
+            System.err.println("[AnimatedCapes] Cape gallery limit reached (Max " + MAX_GALLERY_CAPES + " capes). Rejecting copy.");
+            return null;
         }
 
         try {

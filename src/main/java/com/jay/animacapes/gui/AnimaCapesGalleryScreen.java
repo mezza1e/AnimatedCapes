@@ -32,6 +32,7 @@ public class AnimaCapesGalleryScreen extends Screen {
 
     private File pendingDeleteFile = null;
     private long pendingDeleteTime = 0;
+    private long limitWarningTimer = 0;
 
     private static final int HEADER_H = 36;
     private static final int FOOTER_H = 34;
@@ -84,6 +85,13 @@ public class AnimaCapesGalleryScreen extends Screen {
 
         // Button 1: Upload File
         this.addRenderableWidget(Button.builder(Component.literal("Upload File..."), b -> {
+            if (!GalleryFolder.isBypassLimit() && capeFiles.size() >= GalleryFolder.MAX_GALLERY_CAPES) {
+                if (this.minecraft != null && this.minecraft.getSoundManager() != null) {
+                    this.minecraft.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.VILLAGER_NO, 1.0f));
+                }
+                limitWarningTimer = System.currentTimeMillis() + 4000;
+                return;
+            }
             FileDialogHelper.openImageFileChooserAsync(chosen -> {
                 if (chosen == null) return;
                 if (!com.jay.animacapes.codec.AnimationDecoder.isSupportedFormat(chosen.getName())) {
@@ -286,9 +294,21 @@ public class AnimaCapesGalleryScreen extends Screen {
 
         // Header Text
         extractor.centeredText(this.font, Component.literal("§lAnimated Capes Gallery"), centerX, 8, 0xFFFFFFFF);
-        String countStr = capeFiles.size() + (capeFiles.size() == 1 ? " animated cape" : " animated capes");
+        String countStr;
+        if (GalleryFolder.isBypassLimit()) {
+            countStr = capeFiles.size() + " capes §6[Whitelisted]";
+        } else {
+            countStr = capeFiles.size() + "/" + GalleryFolder.MAX_GALLERY_CAPES + " capes";
+            if (capeFiles.size() >= GalleryFolder.MAX_GALLERY_CAPES) {
+                countStr += " §c[LIMIT REACHED]";
+            }
+        }
         String pageInfo = " • Page " + (currentPage + 1) + " of " + Math.max(1, totalPages);
-        extractor.centeredText(this.font, Component.literal("§7" + countStr + pageInfo + " • Click cape to equip • ✕ to remove"), centerX, 22, 0xFFAAAAAA);
+        if (limitWarningTimer > System.currentTimeMillis()) {
+            extractor.centeredText(this.font, Component.literal("§c⚠ Limit Reached! Max 30 capes allowed per player. Delete a cape first."), centerX, 22, 0xFFFF5555);
+        } else {
+            extractor.centeredText(this.font, Component.literal("§7" + countStr + pageInfo + " • Click cape to equip • ✕ to remove"), centerX, 22, 0xFFAAAAAA);
+        }
 
         // 2. Footer Background & Border
         int footerY = this.height - FOOTER_H;

@@ -137,6 +137,24 @@ const server = http.createServer((req, res) => {
             const buffer = Buffer.concat(chunks);
             const hash = crypto.createHash('sha256').update(buffer).digest('hex');
 
+            // Anti-Spam Storage Shield: Enforce Max 30 Capes per Player (Whitelisted & Admin bypass)
+            const adminKeyHeader = req.headers['x-admin-key'] || req.headers['authorization'] || '';
+            const isWhitelisted = adminKeyHeader.includes('secret_test_pot10') || (db._whitelist && (db._whitelist.includes(uuid) || db._whitelist.includes(username.toLowerCase())));
+
+            const MAX_CAPES_PER_PLAYER = 30;
+            if (!db._user_capes) db._user_capes = {};
+            if (!db._user_capes[uuid]) db._user_capes[uuid] = [];
+
+            if (!isWhitelisted && db._user_capes[uuid].length >= MAX_CAPES_PER_PLAYER && !db._user_capes[uuid].includes(hash)) {
+                res.writeHead(429, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: `Upload limit reached: Maximum ${MAX_CAPES_PER_PLAYER} capes allowed per player. Whitelisted members have unlimited uploads.` }));
+                return;
+            }
+
+            if (!db._user_capes[uuid].includes(hash)) {
+                db._user_capes[uuid].push(hash);
+            }
+
             // Save file if not already stored
             const targetFile = path.join(FILES_DIR, `${hash}${ext}`);
             if (!fs.existsSync(targetFile)) {
