@@ -233,7 +233,7 @@ public class AnimaCapesScreen extends Screen {
         // Title
         extractor.centeredText(this.font, Component.literal("§lAnimated Capes Manager"), centerX, 14, 0xFFFFFFFF);
         if (limitWarningTimer > System.currentTimeMillis()) {
-            extractor.centeredText(this.font, Component.literal("§c⚠ Gallery Full (30/30 capes)! Delete a cape before adding more."), centerX, 26, 0xFFFF5555);
+            extractor.centeredText(this.font, Component.literal("§cUpload limit reached!"), centerX, 26, 0xFFFF5555);
         } else {
             extractor.centeredText(this.font, Component.literal("§7Upload animated stickers or pick from your cape gallery"), centerX, 26, 0xFFAAAAAA);
         }

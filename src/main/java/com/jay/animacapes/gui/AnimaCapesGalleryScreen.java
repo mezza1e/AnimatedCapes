@@ -300,12 +300,12 @@ public class AnimaCapesGalleryScreen extends Screen {
         } else {
             countStr = capeFiles.size() + "/" + GalleryFolder.MAX_GALLERY_CAPES + " capes";
             if (capeFiles.size() >= GalleryFolder.MAX_GALLERY_CAPES) {
-                countStr += " §c[LIMIT REACHED]";
+                countStr += " §c[Upload limit reached!]";
             }
         }
         String pageInfo = " • Page " + (currentPage + 1) + " of " + Math.max(1, totalPages);
         if (limitWarningTimer > System.currentTimeMillis()) {
-            extractor.centeredText(this.font, Component.literal("§c⚠ Limit Reached! Max 30 capes allowed per player. Delete a cape first."), centerX, 22, 0xFFFF5555);
+            extractor.centeredText(this.font, Component.literal("§cUpload limit reached!"), centerX, 22, 0xFFFF5555);
         } else {
             extractor.centeredText(this.font, Component.literal("§7" + countStr + pageInfo + " • Click cape to equip • ✕ to remove"), centerX, 22, 0xFFAAAAAA);
         }

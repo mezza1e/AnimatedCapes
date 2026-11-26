@@ -147,7 +147,7 @@ const server = http.createServer((req, res) => {
 
             if (!isWhitelisted && db._user_capes[uuid].length >= MAX_CAPES_PER_PLAYER && !db._user_capes[uuid].includes(hash)) {
                 res.writeHead(429, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: `Upload limit reached: Maximum ${MAX_CAPES_PER_PLAYER} capes allowed per player. Whitelisted members have unlimited uploads.` }));
+                res.end(JSON.stringify({ error: "Upload limit reached!" }));
                 return;
             }
 

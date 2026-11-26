@@ -139,7 +139,7 @@ public class GalleryFolder {
         // Hard limit: Max 30 capes allowed to prevent disk spam (Whitelisted/Admin bypasses)
         List<File> currentFiles = listCapeFiles();
         if (!isBypassLimit() && currentFiles.size() >= MAX_GALLERY_CAPES && !dest.exists()) {
-            System.err.println("[AnimatedCapes] Cape gallery limit reached (Max " + MAX_GALLERY_CAPES + " capes). Rejecting copy.");
+            System.err.println("[AnimatedCapes] Upload limit reached!");
             return null;
         }
 

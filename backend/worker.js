@@ -596,7 +596,7 @@ export default {
 
       if (!isWhitelisted && userCapes.length >= MAX_CAPES_PER_PLAYER && !userCapes.includes(fileHash)) {
         return new Response(JSON.stringify({
-          error: `Upload limit reached! Maximum ${MAX_CAPES_PER_PLAYER} capes allowed per player to prevent storage spam. Whitelisted members have unlimited uploads.`
+          error: 'Upload limit reached!'
         }), {
           status: 429,
           headers: corsHeaders,

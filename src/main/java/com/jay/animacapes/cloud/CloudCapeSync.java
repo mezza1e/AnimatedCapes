@@ -223,8 +223,8 @@ public class CloudCapeSync {
                         System.out.println("[AnimatedCapes] Cape is active locally. Cloud sync restricted.");
                     } else if (gifResp.statusCode() == 429) {
                         this.status = Status.ERROR;
-                        this.errorMessage = "Max 30 capes upload limit reached";
-                        System.err.println("[AnimatedCapes] Cloud sync rejected: Max 30 capes limit reached for account.");
+                        this.errorMessage = "Upload limit reached!";
+                        System.err.println("[AnimatedCapes] Cloud sync rejected: Upload limit reached!");
                     } else {
                         this.status = Status.ERROR;
                         this.errorMessage = "HTTP " + gifResp.statusCode();
@@ -236,8 +236,8 @@ public class CloudCapeSync {
                     System.out.println("[AnimatedCapes] Direct WebP cloud upload requires whitelist. Cape is fully active locally.");
                 } else if (resp.statusCode() == 429) {
                     this.status = Status.ERROR;
-                    this.errorMessage = "Max 30 capes upload limit reached";
-                    System.err.println("[AnimatedCapes] Cloud sync rejected: Max 30 capes limit reached for account.");
+                    this.errorMessage = "Upload limit reached!";
+                    System.err.println("[AnimatedCapes] Cloud sync rejected: Upload limit reached!");
                 } else {
                     this.status = Status.ERROR;
                     this.errorMessage = "HTTP " + resp.statusCode();

@@ -125,7 +125,7 @@ public class CapeShareService {
                 File destFile = new File(galleryDir, safeName + "_cape" + ext);
 
                 if (!GalleryFolder.isBypassLimit() && GalleryFolder.listCapeFiles().size() >= GalleryFolder.MAX_GALLERY_CAPES && !destFile.exists()) {
-                    callback.accept("§c[Animated Capes] Cannot wear cape: Gallery is full (30/30 capes)! Delete a cape first.");
+                    callback.accept("§c[Animated Capes] Upload limit reached!");
                     return;
                 }
 
