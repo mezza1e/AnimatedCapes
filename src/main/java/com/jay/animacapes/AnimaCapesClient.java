@@ -52,9 +52,10 @@ public class AnimaCapesClient implements ClientModInitializer {
 
         // 4. Load configured cape and sync account/privacy status once client starts
         ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
+            AnimaCapesConfig config = AnimaCapesConfig.getInstance();
+            com.jay.animacapes.cloud.CloudCapeSync.getInstance().setWhitelistedAccount(config.cachedWhitelisted);
             com.jay.animacapes.cloud.CloudCapeSync.getInstance().refreshWhitelistStatusAsync();
             com.jay.animacapes.cloud.CloudCapeSync.getInstance().syncPrivacySettingsAsync();
-            AnimaCapesConfig config = AnimaCapesConfig.getInstance();
             if (config.enabled && config.capeFilePath != null && !config.capeFilePath.trim().isEmpty()) {
                 CapeAnimationEngine.getInstance().reload();
             }

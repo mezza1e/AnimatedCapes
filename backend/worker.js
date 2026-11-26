@@ -273,7 +273,7 @@ export default {
           storage: b2Active ? 'Backblaze B2 (10GB) + Cloudflare Edge Cache' : 'Cloudflare KV (animated-capes-storage)',
           backblazeB2: b2Active,
           whitelist: ['webp', 'gif', 'png', 'jpg', 'jpeg'],
-          limits: { webp: '20MB', gif: '10MB', static: '5MB' },
+          limits: { webp: '5MB (20MB whitelisted)', gif: '10MB', static: '5MB' },
           edge: true,
         }),
         { headers: corsHeaders }
@@ -1033,7 +1033,7 @@ export default {
         });
       }
 
-      const maxBytes = isWebp ? 20 * 1024 * 1024 :
+      const maxBytes = isWebp ? (isWhitelisted ? 20 * 1024 * 1024 : 5 * 1024 * 1024) :
                        isGif  ? 10 * 1024 * 1024 :
                        5 * 1024 * 1024;
 

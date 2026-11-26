@@ -110,7 +110,14 @@ public class CloudCapeSync {
                 if (cfg.isAdmin()) reqBuilder.header("X-Admin-Secret", cfg.adminKey.trim());
 
                 HttpResponse<String> resp = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
-                this.whitelistedAccount = (resp.statusCode() == 200);
+                boolean wl = (resp.statusCode() == 200);
+                if (resp.statusCode() == 200 || resp.statusCode() == 403) {
+                    this.whitelistedAccount = wl;
+                    if (cfg.cachedWhitelisted != wl) {
+                        cfg.cachedWhitelisted = wl;
+                        cfg.save();
+                    }
+                }
             } catch (Throwable ignored) {}
         });
     }
@@ -240,18 +247,27 @@ public class CloudCapeSync {
                 if (lowerName.endsWith(".gif")) {
                     originalGif = fileToUpload;
                     File opt = com.jay.animacapes.codec.WebpOptimizer.optimizeGifToWebp(fileToUpload, com.jay.animacapes.gui.GalleryFolder.getFolder());
-                    if (opt != null && opt.exists() && opt.length() > 0 && opt.length() < fileToUpload.length()) {
+                    if (opt != null && opt.exists() && opt.length() > 0 && opt.length() < fileToUpload.length()
+                            && opt.length() <= com.jay.animacapes.codec.AnimationDecoder.getMaxAllowedBytes(opt.getName())) {
                         fileToUpload = opt;
                         cfg.capeFilePath = opt.getAbsolutePath();
                         cfg.save();
                     }
                 } else if (lowerName.endsWith(".png") || lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) {
                     File opt = com.jay.animacapes.codec.WebpOptimizer.optimizeStaticImageToLosslessWebp(fileToUpload, com.jay.animacapes.gui.GalleryFolder.getFolder());
-                    if (opt != null && opt.exists() && opt.length() > 0 && opt.length() < fileToUpload.length()) {
+                    if (opt != null && opt.exists() && opt.length() > 0 && opt.length() < fileToUpload.length()
+                            && opt.length() <= com.jay.animacapes.codec.AnimationDecoder.getMaxAllowedBytes(opt.getName())) {
                         fileToUpload = opt;
                         cfg.capeFilePath = opt.getAbsolutePath();
                         cfg.save();
                     }
+                }
+
+                long finalMaxBytes = com.jay.animacapes.codec.AnimationDecoder.getMaxAllowedBytes(fileToUpload.getName());
+                if (fileToUpload.length() > finalMaxBytes) {
+                    this.status = Status.ERROR;
+                    this.errorMessage = "File exceeds " + (finalMaxBytes / (1024 * 1024)) + "MB limit";
+                    return;
                 }
 
                 String actualHash = computeFileSha256(fileToUpload);

@@ -1102,6 +1102,8 @@ public class ClientCommandHandler {
                 HttpResponse<String> resp = HTTP_CLIENT.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 200) {
                     CloudCapeSync.getInstance().setWhitelistedAccount(true);
+                    cfg.cachedWhitelisted = true;
+                    cfg.save();
                     JsonObject obj = JsonParser.parseString(resp.body()).getAsJsonObject();
                     JsonArray list = obj.has("combinedList") ? obj.getAsJsonArray("combinedList") : new JsonArray();
                     printFeedback("§b[Animated Capes] Current Whitelist (" + list.size() + " entries):");
@@ -1114,6 +1116,8 @@ public class ClientCommandHandler {
                     }
                 } else if (resp.statusCode() == 403) {
                     CloudCapeSync.getInstance().setWhitelistedAccount(false);
+                    cfg.cachedWhitelisted = false;
+                    cfg.save();
                     printFeedback("§c[Animated Capes] Access Denied: Only the owner or whitelisted players can view the whitelist.");
                 } else {
                     printFeedback("§c[Animated Capes] HTTP " + resp.statusCode() + ": " + resp.body());

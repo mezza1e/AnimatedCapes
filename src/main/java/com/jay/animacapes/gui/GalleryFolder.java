@@ -129,6 +129,10 @@ public class GalleryFolder {
 
     public static File copyToGallery(File source) {
         if (source == null || !source.exists() || !source.isFile()) return null;
+        if (source.length() > com.jay.animacapes.codec.AnimationDecoder.getMaxAllowedBytes(source.getName())) {
+            System.err.println("[AnimatedCapes] File exceeds allowed size limit.");
+            return null;
+        }
         File galleryDir = getFolder();
         File dest = new File(galleryDir, source.getName());
 

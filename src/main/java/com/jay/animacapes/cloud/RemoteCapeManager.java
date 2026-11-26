@@ -211,7 +211,7 @@ public class RemoteCapeManager {
         if (cachedFile != null && cachedFile.exists()) {
             final File toDecode = cachedFile;
             try {
-                DecodedAnimation anim = AnimationDecoder.decode(toDecode);
+                DecodedAnimation anim = AnimationDecoder.decodeRemote(toDecode);
                 if (anim != null && anim.getFrameCount() > 0) {
                     Minecraft mc = Minecraft.getInstance();
                     if (mc != null) {

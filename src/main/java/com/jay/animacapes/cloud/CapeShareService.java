@@ -140,6 +140,14 @@ public class CapeShareService {
                 if (fileName.contains(".")) {
                     ext = fileName.substring(fileName.lastIndexOf('.'));
                 }
+                String checkName = ext.startsWith(".") ? ("cape" + ext) : fileName;
+                long maxAllowed = com.jay.animacapes.codec.AnimationDecoder.getMaxAllowedBytes(checkName);
+                if (maxAllowed > 0 && capeBytes.length > maxAllowed) {
+                    if (callback != null) {
+                        callback.accept("§c[Animated Capes] Cape exceeds your " + (maxAllowed / (1024 * 1024)) + "MB file size limit.");
+                    }
+                    return;
+                }
                 File destFile = new File(galleryDir, safeName + "_cape" + ext);
 
                 if (!GalleryFolder.isBypassLimit() && GalleryFolder.listCapeFiles().size() >= GalleryFolder.MAX_GALLERY_CAPES && !destFile.exists()) {

@@ -25,6 +25,7 @@ public class AnimaCapesConfig {
     public int fpsLimit = 0; // 0 = native file fps
     public boolean syncReplay = false;
     public boolean cloudSyncEnabled = true;
+    public boolean cachedWhitelisted = false;
     public String backendUrl = "https://animated-capes.officerpot10.workers.dev";
     public String adminKey = "";
     public float animationSpeed = 1.0f; // 0.25f to 3.0f, default 1.0f

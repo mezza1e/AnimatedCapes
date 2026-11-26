@@ -45,7 +45,7 @@ Press **`H`** on your keyboard at any time in-game to open the **Animated Capes 
 
 | Format | Max File Size | Animation Support | Notes |
 | :--- | :---: | :---: | :--- |
-| **WebP** (`.webp`) | **20 MB** | ✅ Yes | Highest quality & best compression. *(Animated WebP requires whitelist)* |
+| **WebP** (`.webp`) | **5 MB** *(20 MB Whitelisted)* | ✅ Yes | Highest quality & best compression. *(Animated WebP requires whitelist)* |
 | **GIF** (`.gif`) | **10 MB** | ✅ Yes | Open to everyone! Drop any Discord sticker or animated GIF directly. |
 | **PNG** (`.png`) | **5 MB** | ❌ Static Only | Pure 100% mathematically lossless compression. *(APNG rejected)* |
 | **JPG / JPEG** (`.jpg`) | **5 MB** | ❌ Static Only | HD wallpaper & photo capes supported with 0 quality loss. |

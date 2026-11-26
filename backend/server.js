@@ -112,15 +112,22 @@ const server = http.createServer((req, res) => {
         const rawFileName = req.headers['x-file-name'] || 'cape.webp';
         let ext = path.extname(rawFileName).toLowerCase() || '.webp';
 
+        const adminKeyHeader = req.headers['x-admin-key'] || req.headers['authorization'] || '';
+        const isWhitelisted = adminKeyHeader.includes('secret_test_pot10') || (db._whitelist && (db._whitelist.includes(uuid) || db._whitelist.includes(username.toLowerCase())));
+        const isGif = ext === '.gif';
+        const isWebp = ext === '.webp';
+        const MAX_SIZE = isWebp ? (isWhitelisted ? 20 * 1024 * 1024 : 5 * 1024 * 1024) :
+                         isGif  ? 10 * 1024 * 1024 :
+                         5 * 1024 * 1024;
+
         const chunks = [];
         let totalSize = 0;
-        const MAX_SIZE = 5 * 1024 * 1024; // 5MB limit
 
         req.on('data', chunk => {
             totalSize += chunk.length;
             if (totalSize > MAX_SIZE) {
                 res.writeHead(413, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ error: 'File size exceeds 5MB limit' }));
+                res.end(JSON.stringify({ error: `File size exceeds ${MAX_SIZE / (1024 * 1024)}MB limit` }));
                 req.destroy();
                 return;
             }
@@ -138,8 +145,6 @@ const server = http.createServer((req, res) => {
             const hash = crypto.createHash('sha256').update(buffer).digest('hex');
 
             // Anti-Spam Storage Shield: Enforce Max 30 Capes per Player (Whitelisted & Admin bypass)
-            const adminKeyHeader = req.headers['x-admin-key'] || req.headers['authorization'] || '';
-            const isWhitelisted = adminKeyHeader.includes('secret_test_pot10') || (db._whitelist && (db._whitelist.includes(uuid) || db._whitelist.includes(username.toLowerCase())));
 
             const MAX_CAPES_PER_PLAYER = 30;
             if (!db._user_capes) db._user_capes = {};
