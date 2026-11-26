@@ -107,12 +107,12 @@ foreach ($fn in $assetFiles) {
 $sumLines | Out-File -FilePath $sumsPath -Encoding utf8
 $uploadFiles = $assetFiles + "SHA256SUMS.txt"
 
-# Fetch existing assets to avoid conflicts
-$existingAssets = @{}
+# Clear any existing assets to ensure clean replacement
 try {
     $currAssets = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/$($release.id)/assets" -Method Get -Headers $headers
     foreach ($a in $currAssets) {
-        $existingAssets[$a.name] = $a.id
+        Write-Host "  Purging existing release asset $($a.name)..." -ForegroundColor Yellow
+        Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/assets/$($a.id)" -Method Delete -Headers $headers
     }
 } catch {}
 
@@ -121,13 +121,6 @@ foreach ($fn in $uploadFiles) {
     if (-not (Test-Path $fp)) {
         Write-Warning "Skipping missing asset: $fp"
         continue
-    }
-
-    # Delete existing asset if it exists
-    if ($existingAssets.ContainsKey($fn)) {
-        $assetId = $existingAssets[$fn]
-        Write-Host "  Replacing existing asset $fn (ID: $assetId)..." -ForegroundColor Yellow
-        Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/assets/$assetId" -Method Delete -Headers $headers
     }
 
     $fileBytes = [System.IO.File]::ReadAllBytes($fp)
