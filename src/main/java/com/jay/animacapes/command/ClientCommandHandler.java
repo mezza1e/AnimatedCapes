@@ -5,6 +5,8 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.jay.animacapes.cloud.CapeShareService;
+import com.jay.animacapes.cloud.CloudCapeSync;
+import com.jay.animacapes.cloud.RemoteCapeManager;
 import com.jay.animacapes.config.AnimaCapesConfig;
 import com.jay.animacapes.gui.AnimaCapesScreen;
 import com.mojang.brigadier.CommandDispatcher;
@@ -24,39 +26,11 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/**
- * Handles in-game client commands for players and administrators:
- *
- * General Player Commands:
- *   /cape menu                       - Open GUI
- *   /cape wear <player>              - Copy & equip cape (subject to permissions)
- *   /cape lock                       - Lock your cape from being copied (default)
- *   /cape unlock                     - Unlock your cape for anyone to copy
- *   /friend add <player>             - Add friend (can copy cape automatically)
- *   /friend remove <player>          - Remove friend
- *   /friend list                     - View friends list
- *   /cape report <player> [reason]   - Report an inappropriate cape to moderation
- *   /cape block <player>             - Block player from viewing cape
- *   /cape unblock <player>           - Unblock player
- *   /cape blocklist                  - View blocked players list
- *   /whitelist                       - View Animated WebP whitelist (Owner & Whitelisted only)
- *   /auth <key>                      - Authenticate yourself
- *   /cape help                       - Show general commands
- *
- * Administrator Commands (/admin):
- *   /admin auth <key>                - Authenticate as administrator
- *   /admin lookup <player>           - Look up player cape & status
- *   /admin purge <player>            - Purge active cape globally from cloud
- *   /admin ban <player> [reason]     - Ban a player (preserves cape in DB)
- *   /admin unban <player>            - Unban a player
- *   /admin banlist                   - View banned players list
- *   /admin whitelist add <player>    - Add a player to the whitelist
- *   /admin whitelist remove <player> - Remove a player from the whitelist
- *   /admin status                    - View backend cloud status
- */
 public class ClientCommandHandler {
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
@@ -69,13 +43,18 @@ public class ClientCommandHandler {
         return t;
     });
 
+    private static final Set<String> ADMIN_SUBCOMMANDS = Set.of(
+            "auth", "logout", "lookup", "purge", "ban", "unban",
+            "banlist", "whitelist", "unwhitelist", "status", "help"
+    );
+
     public static void init() {
-        // 1. Register with Brigadier Command Dispatcher
+        // 1. Register Brigadier Command Dispatcher
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, buildContext) -> {
             registerBrigadierCommands(dispatcher);
         });
 
-        // 2. Register fallback interceptor
+        // 2. Fallback interceptor for custom clients & alias variations
         ClientSendMessageEvents.ALLOW_COMMAND.register(command -> {
             String raw = command.trim();
             if (raw.startsWith("/")) {
@@ -85,18 +64,34 @@ public class ClientCommandHandler {
             String lower = raw.toLowerCase();
 
             // Menu
-            if (lower.equals("cape menu") || lower.equals("ac menu") || lower.equals("menu")) {
+            if (lower.equals("cape menu") || lower.equals("ac menu")) {
                 openMenu();
                 return false;
             }
 
-            // Lock / Unlock
-            if (lower.equals("cape lock") || lower.equals("ac lock") || lower.equals("capelock")) {
+            // Copy Lock / Unlock & Specific Player Copy Block
+            if (lower.equals("cape lock") || lower.equals("ac lock") || lower.equals("cape copylock") || lower.equals("capelock")) {
                 handleLock(true);
                 return false;
             }
-            if (lower.equals("cape unlock") || lower.equals("ac unlock") || lower.equals("capeunlock")) {
+            if (lower.equals("cape unlock") || lower.equals("ac unlock") || lower.equals("cape copyunlock") || lower.equals("capeunlock")) {
                 handleLock(false);
+                return false;
+            }
+            if (lower.startsWith("cape blockcopy ") || lower.startsWith("ac blockcopy ") || lower.startsWith("blockcopy ")) {
+                String target = raw;
+                if (lower.startsWith("cape blockcopy ")) target = raw.substring(15).trim();
+                else if (lower.startsWith("ac blockcopy ")) target = raw.substring(13).trim();
+                else if (lower.startsWith("blockcopy ")) target = raw.substring(10).trim();
+                handleBlockCopy(target);
+                return false;
+            }
+            if (lower.startsWith("cape unblockcopy ") || lower.startsWith("ac unblockcopy ") || lower.startsWith("unblockcopy ")) {
+                String target = raw;
+                if (lower.startsWith("cape unblockcopy ")) target = raw.substring(17).trim();
+                else if (lower.startsWith("ac unblockcopy ")) target = raw.substring(15).trim();
+                else if (lower.startsWith("unblockcopy ")) target = raw.substring(12).trim();
+                handleUnblockCopy(target);
                 return false;
             }
 
@@ -117,10 +112,10 @@ public class ClientCommandHandler {
             }
 
             // Auth commands
-            boolean isAuth = lower.startsWith("auth ") || lower.equals("auth") ||
-                             lower.startsWith("cape auth ") || lower.startsWith("cape key ");
-            if (isAuth) {
-                String key = raw;
+            if (lower.startsWith("auth ") || lower.equals("auth") ||
+                lower.startsWith("cape auth ") || lower.equals("cape auth") ||
+                lower.startsWith("cape key ")) {
+                String key = "";
                 if (lower.startsWith("cape auth ")) key = raw.substring(10).trim();
                 else if (lower.startsWith("cape key ")) key = raw.substring(9).trim();
                 else if (lower.startsWith("auth ")) key = raw.substring(5).trim();
@@ -128,32 +123,39 @@ public class ClientCommandHandler {
                 return false;
             }
 
-            // Whitelist commands
-            if (lower.startsWith("whitelist") || lower.startsWith("cape whitelist") || lower.startsWith("ac whitelist")) {
+            // Whitelist / Unwhitelist commands
+            if (lower.equals("whitelist") || lower.startsWith("whitelist ") ||
+                lower.equals("cape whitelist") || lower.startsWith("cape whitelist ") ||
+                lower.equals("ac whitelist") || lower.startsWith("ac whitelist ")) {
                 handleWhitelistRaw(raw);
                 return false;
             }
-            if (lower.startsWith("unwhitelist") || lower.startsWith("cape unwhitelist") || lower.startsWith("ac unwhitelist")) {
+            if (lower.equals("unwhitelist") || lower.startsWith("unwhitelist ") ||
+                lower.equals("cape unwhitelist") || lower.startsWith("cape unwhitelist ") ||
+                lower.equals("ac unwhitelist") || lower.startsWith("ac unwhitelist ")) {
                 handleUnwhitelistRaw(raw);
                 return false;
             }
 
-            // Ban commands
+            // Ban / Unban / Banlist commands (Strictly Admin Only)
             if (lower.startsWith("ban ") || lower.startsWith("cape ban ") || lower.startsWith("ac ban ")) {
                 if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                    printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
+                    printFeedback("§c[Animated Capes] Permission Denied: Only administrators can use this command.");
                     return false;
                 }
-                String target = raw;
-                if (lower.startsWith("cape ban ")) target = raw.substring(9).trim();
-                else if (lower.startsWith("ac ban ")) target = raw.substring(7).trim();
-                else if (lower.startsWith("ban ")) target = raw.substring(4).trim();
-                handleAdminBan(target, "Inappropriate behavior");
+                String rem = raw;
+                if (lower.startsWith("cape ban ")) rem = raw.substring(9).trim();
+                else if (lower.startsWith("ac ban ")) rem = raw.substring(7).trim();
+                else if (lower.startsWith("ban ")) rem = raw.substring(4).trim();
+                String[] parts = rem.split("\\s+", 2);
+                String target = parts[0];
+                String reason = parts.length > 1 ? parts[1] : "Banned by administrator";
+                handleAdminBan(target, reason);
                 return false;
             }
             if (lower.startsWith("unban ") || lower.startsWith("cape unban ") || lower.startsWith("ac unban ")) {
                 if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                    printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
+                    printFeedback("§c[Animated Capes] Permission Denied: Only administrators can use this command.");
                     return false;
                 }
                 String target = raw;
@@ -163,9 +165,9 @@ public class ClientCommandHandler {
                 handleModify("ban", "DELETE", target);
                 return false;
             }
-            if (lower.equals("banlist") || lower.equals("cape banlist") || lower.equals("ac banlist")) {
+            if (lower.equals("banlist") || lower.equals("cape banlist") || lower.equals("ac banlist") || lower.equals("cape bans")) {
                 if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                    printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required to view the banlist.");
+                    printFeedback("§c[Animated Capes] Permission Denied: Only administrators can view the banlist.");
                     return false;
                 }
                 handleList("ban");
@@ -173,8 +175,7 @@ public class ClientCommandHandler {
             }
 
             // Wear / Copy
-            boolean isWear = lower.startsWith("wearcape ") || lower.startsWith("cape wear ") || lower.startsWith("cape copy ") || lower.startsWith("ac wear ");
-            if (isWear) {
+            if (lower.startsWith("wearcape ") || lower.startsWith("cape wear ") || lower.startsWith("cape copy ") || lower.startsWith("ac wear ")) {
                 String target = "";
                 if (lower.startsWith("cape wear ")) target = raw.substring(10).trim();
                 else if (lower.startsWith("cape copy ")) target = raw.substring(10).trim();
@@ -187,8 +188,7 @@ public class ClientCommandHandler {
             }
 
             // Report
-            boolean isReport = lower.startsWith("reportcape ") || lower.startsWith("cape report ") || lower.startsWith("ac report ");
-            if (isReport) {
+            if (lower.startsWith("reportcape ") || lower.startsWith("cape report ") || lower.startsWith("ac report ")) {
                 String rem = "";
                 if (lower.startsWith("cape report ")) rem = raw.substring(12).trim();
                 else if (lower.startsWith("ac report ")) rem = raw.substring(10).trim();
@@ -223,7 +223,7 @@ public class ClientCommandHandler {
                     return false;
                 }
             }
-            if (lower.equals("blocklist") || lower.equals("cape blocklist") || lower.equals("ac blocklist")) {
+            if (lower.equals("blocklist") || lower.equals("cape blocklist") || lower.equals("ac blocklist") || lower.equals("cape blocks")) {
                 printBlockList();
                 return false;
             }
@@ -255,10 +255,41 @@ public class ClientCommandHandler {
         AnimaCapesConfig cfg = AnimaCapesConfig.getInstance();
         cfg.allowCapeCopy = !lock;
         cfg.save();
+        CloudCapeSync.getInstance().syncPrivacySettingsAsync();
         if (lock) {
             printFeedback("§e[Animated Capes] Cape copying locked. Non-friends cannot copy your cape (Default).");
         } else {
-            printFeedback("§a[Animated Capes] Cape copying unlocked. Any player can now copy and wear your cape.");
+            printFeedback("§a[Animated Capes] Cape copying unlocked. Other players can now copy your cape.");
+        }
+    }
+
+    public static void handleBlockCopy(String player) {
+        if (player == null || player.trim().isEmpty()) {
+            printFeedback("§c[Animated Capes] Usage: /cape blockcopy <player>");
+            return;
+        }
+        String clean = player.trim();
+        boolean added = AnimaCapesConfig.getInstance().blockCopyUser(clean);
+        CloudCapeSync.getInstance().syncPrivacySettingsAsync();
+        if (added) {
+            printFeedback("§e[Animated Capes] Blocked §f" + clean + "§e from copying your cape.");
+        } else {
+            printFeedback("§e[Animated Capes] Player §f" + clean + "§e is already blocked from copying your cape.");
+        }
+    }
+
+    public static void handleUnblockCopy(String player) {
+        if (player == null || player.trim().isEmpty()) {
+            printFeedback("§c[Animated Capes] Usage: /cape unblockcopy <player>");
+            return;
+        }
+        String clean = player.trim();
+        boolean removed = AnimaCapesConfig.getInstance().unblockCopyUser(clean);
+        CloudCapeSync.getInstance().syncPrivacySettingsAsync();
+        if (removed) {
+            printFeedback("§a[Animated Capes] Unblocked §f" + clean + "§a from copying your cape.");
+        } else {
+            printFeedback("§c[Animated Capes] Player §f" + clean + "§c was not in your copy-block list.");
         }
     }
 
@@ -280,6 +311,8 @@ public class ClientCommandHandler {
             handleAddFriend(parts[1].trim());
         } else if (action.equals("remove") && parts.length > 1) {
             handleRemoveFriend(parts[1].trim());
+        } else if (parts.length == 1 && !action.isEmpty() && !action.equals("add") && !action.equals("remove")) {
+            handleAddFriend(parts[0].trim());
         } else {
             printFeedback("§c[Animated Capes] Usage: /friend <add|remove|list> [player]");
         }
@@ -290,11 +323,13 @@ public class ClientCommandHandler {
             printFeedback("§c[Animated Capes] Usage: /friend add <player>");
             return;
         }
-        boolean added = AnimaCapesConfig.getInstance().addFriend(player.trim());
+        String clean = player.trim();
+        boolean added = AnimaCapesConfig.getInstance().addFriend(clean);
+        CloudCapeSync.getInstance().syncPrivacySettingsAsync();
         if (added) {
-            printFeedback("§a[Animated Capes] Added §f" + player.trim() + "§a to your friends list! They can now automatically copy your cape.");
+            printFeedback("§a[Animated Capes] Added §f" + clean + "§a as a friend! Friends can automatically copy each other's capes.");
         } else {
-            printFeedback("§e[Animated Capes] Player §f" + player.trim() + "§e is already on your friends list.");
+            printFeedback("§e[Animated Capes] Player §f" + clean + "§e is already on your friends list.");
         }
     }
 
@@ -303,16 +338,18 @@ public class ClientCommandHandler {
             printFeedback("§c[Animated Capes] Usage: /friend remove <player>");
             return;
         }
-        boolean removed = AnimaCapesConfig.getInstance().removeFriend(player.trim());
+        String clean = player.trim();
+        boolean removed = AnimaCapesConfig.getInstance().removeFriend(clean);
+        CloudCapeSync.getInstance().syncPrivacySettingsAsync();
         if (removed) {
-            printFeedback("§a[Animated Capes] Removed §f" + player.trim() + "§a from your friends list.");
+            printFeedback("§a[Animated Capes] Removed §f" + clean + "§a from your friends list.");
         } else {
-            printFeedback("§c[Animated Capes] Player §f" + player.trim() + "§c was not on your friends list.");
+            printFeedback("§c[Animated Capes] Player §f" + clean + "§c was not on your friends list.");
         }
     }
 
     public static void printFriendsList() {
-        java.util.List<String> friends = AnimaCapesConfig.getInstance().getFriends();
+        List<String> friends = AnimaCapesConfig.getInstance().getFriends();
         printFeedback("§b[Animated Capes] Friends List (" + friends.size() + " friends):");
         if (friends.isEmpty()) {
             printFeedback("  §7(No friends added yet. Use /friend add <player> to add friends!)");
@@ -337,11 +374,29 @@ public class ClientCommandHandler {
             return;
         }
 
+        if (clean.toLowerCase().startsWith("key ")) {
+            handleAuth(clean.substring(4).trim());
+            return;
+        }
+
         String[] parts = clean.split("\\s+", 3);
         String action = parts[0].toLowerCase();
 
-        if (action.equals("auth") && parts.length > 1) {
-            handleAuth(parts[1].trim());
+        if (action.equals("auth")) {
+            handleAuth(parts.length > 1 ? clean.substring(5).trim() : "");
+            return;
+        }
+
+        if (action.equals("logout")) {
+            AnimaCapesConfig.getInstance().adminKey = "";
+            AnimaCapesConfig.getInstance().save();
+            printFeedback("§e[Animated Capes] Logged out of administrator session.");
+            return;
+        }
+
+        // Allow direct `/admin <secret_key>` when first token is not a subcommand
+        if (parts.length == 1 && !ADMIN_SUBCOMMANDS.contains(action)) {
+            handleAuth(parts[0].trim());
             return;
         }
 
@@ -366,13 +421,15 @@ public class ClientCommandHandler {
                 handleModify("whitelist", "POST", parts[2].trim());
             } else if (parts.length >= 3 && parts[1].equalsIgnoreCase("remove")) {
                 handleModify("whitelist", "DELETE", parts[2].trim());
+            } else if (parts.length == 2 && !parts[1].equalsIgnoreCase("list")) {
+                handleModify("whitelist", "POST", parts[1].trim());
             } else {
                 handleWhitelistView();
             }
+        } else if (action.equals("unwhitelist") && parts.length > 1) {
+            handleModify("whitelist", "DELETE", parts[1].trim());
         } else if (action.equals("status")) {
             handleStatus();
-        } else if (action.equals("help")) {
-            printAdminHelp();
         } else {
             printAdminHelp();
         }
@@ -395,7 +452,7 @@ public class ClientCommandHandler {
         }
 
         if (!AnimaCapesConfig.getInstance().isAdmin()) {
-            printFeedback("§c[Animated Capes] Permission Denied: Only administrators can modify the whitelist. Whitelisted members can view with /whitelist.");
+            printFeedback("§c[Animated Capes] Permission Denied: Only administrators can modify the whitelist.");
             return;
         }
 
@@ -417,6 +474,7 @@ public class ClientCommandHandler {
         if (clean.toLowerCase().startsWith("cape unwhitelist ")) clean = clean.substring(17).trim();
         else if (clean.toLowerCase().startsWith("ac unwhitelist ")) clean = clean.substring(15).trim();
         else if (clean.toLowerCase().startsWith("unwhitelist ")) clean = clean.substring(12).trim();
+        else clean = "";
 
         if (!clean.isEmpty()) {
             handleModify("whitelist", "DELETE", clean);
@@ -426,13 +484,12 @@ public class ClientCommandHandler {
     }
 
     private static void registerBrigadierCommands(CommandDispatcher<FabricClientCommandSource> dispatcher) {
-        // /auth <key> (Description: Authenticate yourself)
+        // /auth <key> - Authenticate yourself
         dispatcher.register(
             LiteralArgumentBuilder.<FabricClientCommandSource>literal("auth")
                 .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("key", StringArgumentType.greedyString())
                     .executes(ctx -> {
-                        String key = StringArgumentType.getString(ctx, "key");
-                        handleAuth(key);
+                        handleAuth(StringArgumentType.getString(ctx, "key"));
                         return 1;
                     }))
         );
@@ -452,20 +509,18 @@ public class ClientCommandHandler {
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("add")
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handleAddFriend(player);
+                            handleAddFriend(StringArgumentType.getString(ctx, "player"));
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("remove")
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handleRemoveFriend(player);
+                            handleRemoveFriend(StringArgumentType.getString(ctx, "player"));
                             return 1;
                         })))
         );
 
-        // /cape
+        // /cape (General commands accessible by everybody)
         dispatcher.register(
             LiteralArgumentBuilder.<FabricClientCommandSource>literal("cape")
                 .executes(ctx -> {
@@ -492,6 +547,18 @@ public class ClientCommandHandler {
                         handleLock(false);
                         return 1;
                     }))
+                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("blockcopy")
+                    .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
+                        .executes(ctx -> {
+                            handleBlockCopy(StringArgumentType.getString(ctx, "player"));
+                            return 1;
+                        })))
+                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("unblockcopy")
+                    .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
+                        .executes(ctx -> {
+                            handleUnblockCopy(StringArgumentType.getString(ctx, "player"));
+                            return 1;
+                        })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("friend")
                     .executes(ctx -> {
                         printFriendsList();
@@ -505,57 +572,46 @@ public class ClientCommandHandler {
                     .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("add")
                         .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                             .executes(ctx -> {
-                                String player = StringArgumentType.getString(ctx, "player");
-                                handleAddFriend(player);
+                                handleAddFriend(StringArgumentType.getString(ctx, "player"));
                                 return 1;
                             })))
                     .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("remove")
                         .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                             .executes(ctx -> {
-                                String player = StringArgumentType.getString(ctx, "player");
-                                handleRemoveFriend(player);
+                                handleRemoveFriend(StringArgumentType.getString(ctx, "player"));
                                 return 1;
                             }))))
-                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("auth")
-                    .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("key", StringArgumentType.greedyString())
-                        .executes(ctx -> {
-                            String key = StringArgumentType.getString(ctx, "key");
-                            handleAuth(key);
-                            return 1;
-                        })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("wear")
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
-                            String player = StringArgumentType.getString(ctx, "player");
-                            CapeShareService.wearPlayerCape(player, ClientCommandHandler::printFeedback);
+                            CapeShareService.wearPlayerCape(StringArgumentType.getString(ctx, "player"), ClientCommandHandler::printFeedback);
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("report")
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
-                            String player = StringArgumentType.getString(ctx, "player");
-                            CapeShareService.reportPlayer(player, "Inappropriate cape", ClientCommandHandler::printFeedback);
+                            CapeShareService.reportPlayer(StringArgumentType.getString(ctx, "player"), "Inappropriate cape", ClientCommandHandler::printFeedback);
                             return 1;
                         })
                         .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("reason", StringArgumentType.greedyString())
                             .executes(ctx -> {
-                                String player = StringArgumentType.getString(ctx, "player");
-                                String reason = StringArgumentType.getString(ctx, "reason");
-                                CapeShareService.reportPlayer(player, reason, ClientCommandHandler::printFeedback);
+                                CapeShareService.reportPlayer(
+                                        StringArgumentType.getString(ctx, "player"),
+                                        StringArgumentType.getString(ctx, "reason"),
+                                        ClientCommandHandler::printFeedback
+                                );
                                 return 1;
                             }))))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("block")
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
-                            String player = StringArgumentType.getString(ctx, "player");
-                            CapeShareService.blockPlayer(player, ClientCommandHandler::printFeedback);
+                            CapeShareService.blockPlayer(StringArgumentType.getString(ctx, "player"), ClientCommandHandler::printFeedback);
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("unblock")
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
-                            String player = StringArgumentType.getString(ctx, "player");
-                            CapeShareService.unblockPlayer(player, ClientCommandHandler::printFeedback);
+                            CapeShareService.unblockPlayer(StringArgumentType.getString(ctx, "player"), ClientCommandHandler::printFeedback);
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("blocklist")
@@ -563,14 +619,9 @@ public class ClientCommandHandler {
                         printBlockList();
                         return 1;
                     }))
-                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("whitelist")
-                    .executes(ctx -> {
-                        handleWhitelistView();
-                        return 1;
-                    }))
         );
 
-        // /whitelist (Description: Add a player to the whitelist)
+        // /whitelist (Viewable by Owner & Whitelisted members; Add/Remove gated strictly to Admins)
         dispatcher.register(
             LiteralArgumentBuilder.<FabricClientCommandSource>literal("whitelist")
                 .executes(ctx -> {
@@ -583,45 +634,55 @@ public class ClientCommandHandler {
                         return 1;
                     }))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("add")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
                             if (!AnimaCapesConfig.getInstance().isAdmin()) {
                                 printFeedback("§c[Animated Capes] Permission Denied: Only administrators can modify the whitelist.");
                                 return 1;
                             }
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handleModify("whitelist", "POST", player);
+                            handleModify("whitelist", "POST", StringArgumentType.getString(ctx, "player"));
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("remove")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
                             if (!AnimaCapesConfig.getInstance().isAdmin()) {
                                 printFeedback("§c[Animated Capes] Permission Denied: Only administrators can modify the whitelist.");
                                 return 1;
                             }
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handleModify("whitelist", "DELETE", player);
+                            handleModify("whitelist", "DELETE", StringArgumentType.getString(ctx, "player"));
                             return 1;
                         })))
+                .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
+                    .executes(ctx -> {
+                        if (!AnimaCapesConfig.getInstance().isAdmin()) {
+                            printFeedback("§c[Animated Capes] Permission Denied: Only administrators can modify the whitelist.");
+                            return 1;
+                        }
+                        handleModify("whitelist", "POST", StringArgumentType.getString(ctx, "player"));
+                        return 1;
+                    }))
         );
 
-        // /unwhitelist (Description: Remove a player from the whitelist)
+        // /unwhitelist <player> (Strictly Admin Only - Remove a player from the whitelist)
         dispatcher.register(
             LiteralArgumentBuilder.<FabricClientCommandSource>literal("unwhitelist")
+                .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                 .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                     .executes(ctx -> {
                         if (!AnimaCapesConfig.getInstance().isAdmin()) {
                             printFeedback("§c[Animated Capes] Permission Denied: Only administrators can modify the whitelist.");
                             return 1;
                         }
-                        String player = StringArgumentType.getString(ctx, "player");
-                        handleModify("whitelist", "DELETE", player);
+                        handleModify("whitelist", "DELETE", StringArgumentType.getString(ctx, "player"));
                         return 1;
                     }))
         );
 
-        // /admin (Strictly for administrators)
+        // /admin (Dedicated Administrator Command Suite)
         dispatcher.register(
             LiteralArgumentBuilder.<FabricClientCommandSource>literal("admin")
                 .executes(ctx -> {
@@ -635,75 +696,89 @@ public class ClientCommandHandler {
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("auth")
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("key", StringArgumentType.greedyString())
                         .executes(ctx -> {
-                            String key = StringArgumentType.getString(ctx, "key");
-                            handleAuth(key);
+                            handleAuth(StringArgumentType.getString(ctx, "key"));
                             return 1;
                         })))
+                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("logout")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
+                    .executes(ctx -> {
+                        AnimaCapesConfig.getInstance().adminKey = "";
+                        AnimaCapesConfig.getInstance().save();
+                        printFeedback("§e[Animated Capes] Logged out of administrator session.");
+                        return 1;
+                    }))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("lookup")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
                             if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
+                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                                 return 1;
                             }
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handleLookup(player);
+                            handleLookup(StringArgumentType.getString(ctx, "player"));
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("purge")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
                             if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
+                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                                 return 1;
                             }
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handlePurge(player);
+                            handlePurge(StringArgumentType.getString(ctx, "player"));
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("ban")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
                             if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
+                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                                 return 1;
                             }
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handleAdminBan(player, "Banned by administrator");
+                            handleAdminBan(StringArgumentType.getString(ctx, "player"), "Banned by administrator");
                             return 1;
                         })
                         .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("reason", StringArgumentType.greedyString())
                             .executes(ctx -> {
                                 if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                                    printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
+                                    printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                                     return 1;
                                 }
-                                String player = StringArgumentType.getString(ctx, "player");
-                                String reason = StringArgumentType.getString(ctx, "reason");
-                                handleAdminBan(player, reason);
+                                handleAdminBan(
+                                        StringArgumentType.getString(ctx, "player"),
+                                        StringArgumentType.getString(ctx, "reason")
+                                );
                                 return 1;
                             }))))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("unban")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                         .executes(ctx -> {
                             if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
+                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                                 return 1;
                             }
-                            String player = StringArgumentType.getString(ctx, "player");
-                            handleModify("ban", "DELETE", player);
+                            handleModify("ban", "DELETE", StringArgumentType.getString(ctx, "player"));
                             return 1;
                         })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("banlist")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .executes(ctx -> {
                         if (!AnimaCapesConfig.getInstance().isAdmin()) {
-                            printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required to view the banlist.");
+                            printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                             return 1;
                         }
                         handleList("ban");
                         return 1;
                     }))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("whitelist")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
+                    .executes(ctx -> {
+                        handleWhitelistView();
+                        return 1;
+                    })
                     .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("add")
                         .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
                             .executes(ctx -> {
@@ -711,8 +786,7 @@ public class ClientCommandHandler {
                                     printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                                     return 1;
                                 }
-                                String player = StringArgumentType.getString(ctx, "player");
-                                handleModify("whitelist", "POST", player);
+                                handleModify("whitelist", "POST", StringArgumentType.getString(ctx, "player"));
                                 return 1;
                             })))
                     .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("remove")
@@ -722,11 +796,22 @@ public class ClientCommandHandler {
                                     printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
                                     return 1;
                                 }
-                                String player = StringArgumentType.getString(ctx, "player");
-                                handleModify("whitelist", "DELETE", player);
+                                handleModify("whitelist", "DELETE", StringArgumentType.getString(ctx, "player"));
                                 return 1;
                             }))))
+                .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("unwhitelist")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
+                    .then(RequiredArgumentBuilder.<FabricClientCommandSource, String>argument("player", StringArgumentType.string())
+                        .executes(ctx -> {
+                            if (!AnimaCapesConfig.getInstance().isAdmin()) {
+                                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
+                                return 1;
+                            }
+                            handleModify("whitelist", "DELETE", StringArgumentType.getString(ctx, "player"));
+                            return 1;
+                        })))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("status")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .executes(ctx -> {
                         if (!AnimaCapesConfig.getInstance().isAdmin()) {
                             printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
@@ -736,7 +821,12 @@ public class ClientCommandHandler {
                         return 1;
                     }))
                 .then(LiteralArgumentBuilder.<FabricClientCommandSource>literal("help")
+                    .requires(src -> AnimaCapesConfig.getInstance().isAdmin())
                     .executes(ctx -> {
+                        if (!AnimaCapesConfig.getInstance().isAdmin()) {
+                            printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
+                            return 1;
+                        }
                         printAdminHelp();
                         return 1;
                     }))
@@ -745,7 +835,7 @@ public class ClientCommandHandler {
 
     public static void handleAuth(String key) {
         if (key == null || key.trim().isEmpty()) {
-            printFeedback("§c[Animated Capes] Usage: /auth <secret_key>");
+            printFeedback("§c[Animated Capes] Usage: /auth <key>");
             return;
         }
 
@@ -757,7 +847,6 @@ public class ClientCommandHandler {
             AnimaCapesConfig cfg = AnimaCapesConfig.getInstance();
             String backend = cfg.backendUrl;
             if (backend == null || backend.trim().isEmpty()) {
-                printFeedback("§e[Animated Capes] Admin key saved locally. Backend URL is not configured.");
                 return;
             }
             if (backend.endsWith("/")) backend = backend.substring(0, backend.length() - 1);
@@ -773,14 +862,20 @@ public class ClientCommandHandler {
 
                 HttpResponse<String> resp = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 200) {
-                    printFeedback("§a[Animated Capes] Admin authentication SUCCESSFUL! You now have full administrative privileges.");
+                    CloudCapeSync.getInstance().setWhitelistedAccount(true);
+                    printFeedback("§a[Animated Capes] Authenticated successfully! Use /admin help for administrator commands.");
                 } else if (resp.statusCode() == 401) {
-                    printFeedback("§c[Animated Capes] Admin key validation failed: 401 Unauthorized. Key saved locally.");
+                    // Revoke invalid key immediately so non-admins never retain admin privileges
+                    if (cleanKey.equals(cfg.adminKey)) {
+                        cfg.adminKey = "";
+                        cfg.save();
+                    }
+                    printFeedback("§c[Animated Capes] Authentication failed: Invalid secret key.");
                 } else {
-                    printFeedback("§e[Animated Capes] Admin key saved. Server responded HTTP " + resp.statusCode());
+                    printFeedback("§e[Animated Capes] Server responded HTTP " + resp.statusCode());
                 }
             } catch (Exception e) {
-                printFeedback("§a[Animated Capes] Admin key configured and saved successfully! You now have owner access.");
+                printFeedback("§a[Animated Capes] Admin key configured locally.");
             }
         });
     }
@@ -821,7 +916,7 @@ public class ClientCommandHandler {
                     printFeedback("§b[Animated Capes Admin] Player Lookup: §f" + name + " §7(" + uuid + ")");
                     printFeedback("  §f• Moderation Status: " + (banned ? "§c[BANNED]" : "§a[ACTIVE]"));
                     printFeedback("  §f• Whitelist Status: " + (whitelisted ? "§6[WHITELISTED]" : "§7[STANDARD]"));
-                    if (hasCape && obj.has("cape")) {
+                    if (hasCape && obj.has("cape") && !obj.get("cape").isJsonNull()) {
                         JsonObject cape = obj.getAsJsonObject("cape");
                         String hash = cape.has("hash") ? cape.get("hash").getAsString() : "unknown";
                         String fn = cape.has("fileName") ? cape.get("fileName").getAsString() : "cape.webp";
@@ -829,7 +924,7 @@ public class ClientCommandHandler {
                         boolean allowCopy = cape.has("allowCopy") && cape.get("allowCopy").getAsBoolean();
                         printFeedback("  §f• Active Cape: §e" + hash.substring(0, Math.min(12, hash.length())) + "... §7(" + fn + ")");
                         printFeedback("  §f• Copy Permission: " + (allowCopy ? "§aPublic" : "§cLocked (Friends Only)"));
-                        printFeedback("  §f• Direct URL: §9" + capeUrl);
+                        printFeedback("  §f• View Cape URL: §9" + capeUrl);
                     } else {
                         printFeedback("  §f• Active Cape: §7None");
                     }
@@ -849,6 +944,9 @@ public class ClientCommandHandler {
             printFeedback("§c[Animated Capes Admin] Usage: /admin purge <player>");
             return;
         }
+        final String cleanTarget = target.trim();
+        RemoteCapeManager.getInstance().purgePlayer(cleanTarget);
+
         EXECUTOR.submit(() -> {
             AnimaCapesConfig cfg = AnimaCapesConfig.getInstance();
             String backend = cfg.backendUrl;
@@ -860,7 +958,7 @@ public class ClientCommandHandler {
 
             try {
                 JsonObject body = new JsonObject();
-                body.addProperty("user", target.trim());
+                body.addProperty("user", cleanTarget);
 
                 HttpRequest req = HttpRequest.newBuilder()
                         .uri(URI.create(backend + "/admin/purge"))
@@ -873,7 +971,12 @@ public class ClientCommandHandler {
 
                 HttpResponse<String> resp = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 200) {
-                    printFeedback("§a[Animated Capes Admin] Successfully purged active cape globally for §f" + target + "§a.");
+                    JsonObject obj = JsonParser.parseString(resp.body()).getAsJsonObject();
+                    if (obj.has("uuid")) {
+                        RemoteCapeManager.getInstance().purgePlayer(obj.get("uuid").getAsString());
+                    }
+                    String dispName = obj.has("name") ? obj.get("name").getAsString() : cleanTarget;
+                    printFeedback("§a[Animated Capes Admin] Purged active cape globally for §f" + dispName + "§a.");
                 } else if (resp.statusCode() == 401) {
                     printFeedback("§c[Animated Capes Admin] Access Denied: Invalid admin key. Use /admin auth <key>.");
                 } else {
@@ -917,7 +1020,9 @@ public class ClientCommandHandler {
 
                 HttpResponse<String> resp = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 200) {
-                    printFeedback("§c[Animated Capes Admin] Successfully banned §f" + target + "§c. (Cape preserved in database; use /admin purge " + target + " to delete globally).");
+                    JsonObject obj = JsonParser.parseString(resp.body()).getAsJsonObject();
+                    String dispName = obj.has("name") ? obj.get("name").getAsString() : target.trim();
+                    printFeedback("§c[Animated Capes Admin] Banned §f" + dispName + "§c. (Cape was NOT purged; use /admin lookup " + dispName + " or /admin purge " + dispName + ").");
                 } else if (resp.statusCode() == 401) {
                     printFeedback("§c[Animated Capes Admin] Access Denied: Invalid admin key. Use /admin auth <key>.");
                 } else {
@@ -969,7 +1074,7 @@ public class ClientCommandHandler {
             }
             if (backend.endsWith("/")) backend = backend.substring(0, backend.length() - 1);
 
-            String requesterName = "Anonymous";
+            String requesterName = "";
             String requesterUuid = "";
             try {
                 Minecraft mc = Minecraft.getInstance();
@@ -996,9 +1101,10 @@ public class ClientCommandHandler {
 
                 HttpResponse<String> resp = HTTP_CLIENT.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 200) {
+                    CloudCapeSync.getInstance().setWhitelistedAccount(true);
                     JsonObject obj = JsonParser.parseString(resp.body()).getAsJsonObject();
                     JsonArray list = obj.has("combinedList") ? obj.getAsJsonArray("combinedList") : new JsonArray();
-                    printFeedback("§b[Animated Capes] Animated WebP Whitelist (" + list.size() + " entries):");
+                    printFeedback("§b[Animated Capes] Current Whitelist (" + list.size() + " entries):");
                     if (list.size() == 0) {
                         printFeedback("  §7(No players whitelisted yet)");
                     } else {
@@ -1007,7 +1113,8 @@ public class ClientCommandHandler {
                         }
                     }
                 } else if (resp.statusCode() == 403) {
-                    printFeedback("§c[Animated Capes] Access Denied: Only whitelisted members and the owner can view the whitelist.");
+                    CloudCapeSync.getInstance().setWhitelistedAccount(false);
+                    printFeedback("§c[Animated Capes] Access Denied: Only the owner or whitelisted players can view the whitelist.");
                 } else {
                     printFeedback("§c[Animated Capes] HTTP " + resp.statusCode() + ": " + resp.body());
                 }
@@ -1035,7 +1142,7 @@ public class ClientCommandHandler {
 
             String adminKey = cfg.adminKey;
             if (adminKey == null || adminKey.trim().isEmpty()) {
-                printFeedback("§c[Animated Capes] Action rejected: Admin authentication required. Use /admin auth <key>.");
+                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required. Use /admin auth <key>.");
                 return;
             }
 
@@ -1060,18 +1167,18 @@ public class ClientCommandHandler {
                 HttpResponse<String> resp = HTTP_CLIENT.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 200) {
                     JsonObject resObj = JsonParser.parseString(resp.body()).getAsJsonObject();
-                    String name = resObj.has("name") ? resObj.get("name").getAsString() : cleanTarget;
+                    String name = resObj.has("name") ? resObj.get("name").getAsString() : (resObj.has("removed") ? resObj.get("removed").getAsString() : cleanTarget);
                     if ("whitelist".equals(type)) {
                         if ("POST".equalsIgnoreCase(method)) {
-                            printFeedback("§a[Animated Capes Admin] Whitelisted §f" + name + "§a for Animated WebP uploads!");
+                            printFeedback("§a[Animated Capes Admin] Added §f" + name + "§a to the whitelist!");
                         } else {
-                            printFeedback("§e[Animated Capes Admin] Removed §f" + name + "§e from Animated WebP whitelist.");
+                            printFeedback("§e[Animated Capes Admin] Removed §f" + name + "§e from the whitelist.");
                         }
                     } else if ("ban".equals(type)) {
                         if ("POST".equalsIgnoreCase(method)) {
-                            printFeedback("§c[Animated Capes Admin] Successfully banned §f" + name + "§c. (Cape preserved in database; use /admin purge " + name + " to delete globally).");
+                            printFeedback("§c[Animated Capes Admin] Banned §f" + name + "§c. (Cape preserved; use /admin purge " + name + " to delete globally).");
                         } else {
-                            printFeedback("§a[Animated Capes Admin] Successfully unbanned §f" + name + "§a.");
+                            printFeedback("§a[Animated Capes Admin] Unbanned §f" + name + "§a.");
                         }
                     }
                 } else if (resp.statusCode() == 401) {
@@ -1095,28 +1202,26 @@ public class ClientCommandHandler {
             }
             if (backend.endsWith("/")) backend = backend.substring(0, backend.length() - 1);
 
-            String adminKey = cfg.adminKey;
-            boolean hasKey = (adminKey != null && !adminKey.trim().isEmpty());
+            if (!cfg.isAdmin()) {
+                printFeedback("§c[Animated Capes] Permission Denied: Admin authentication required.");
+                return;
+            }
 
             try {
-                String url = hasKey ? (backend + "/admin/" + endpointType) : (backend + "/" + (endpointType.equals("whitelist") ? "whitelist" : "banlist"));
-
-                HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
-                        .uri(URI.create(url))
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(backend + "/admin/" + endpointType))
                         .timeout(Duration.ofSeconds(10))
                         .header("User-Agent", "AnimatedCapes-Mod/1.0.0")
-                        .GET();
+                        .header("X-Admin-Secret", cfg.adminKey.trim())
+                        .GET()
+                        .build();
 
-                if (hasKey) {
-                    reqBuilder.header("X-Admin-Secret", adminKey);
-                }
-
-                HttpResponse<String> resp = HTTP_CLIENT.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
+                HttpResponse<String> resp = HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
                 if (resp.statusCode() == 200) {
                     JsonObject obj = JsonParser.parseString(resp.body()).getAsJsonObject();
                     if ("whitelist".equals(endpointType)) {
                         JsonArray list = obj.has("combinedList") ? obj.getAsJsonArray("combinedList") : new JsonArray();
-                        printFeedback("§b[Animated Capes] Animated WebP Whitelist (" + list.size() + " entries):");
+                        printFeedback("§b[Animated Capes Admin] Whitelist (" + list.size() + " entries):");
                         if (list.size() == 0) {
                             printFeedback("  §7(No players whitelisted yet)");
                         } else {
@@ -1147,7 +1252,7 @@ public class ClientCommandHandler {
     }
 
     public static void printBlockList() {
-        java.util.List<String> list = AnimaCapesConfig.getInstance().getBlockedUsers();
+        List<String> list = AnimaCapesConfig.getInstance().getBlockedUsers();
         printFeedback("§e[Animated Capes] Blocked Users (" + list.size() + " entries):");
         if (list.isEmpty()) {
             printFeedback("  §7(No players blocked)");
@@ -1162,34 +1267,34 @@ public class ClientCommandHandler {
         printFeedback("§b=== Animated Capes Commands ===");
         printFeedback("§f/cape menu §7- Open the Animated Capes Manager & Gallery GUI");
         printFeedback("§f/cape wear <player> §7- Search & equip another player's active cape");
-        printFeedback("§f/cape lock §7- Lock your cape from being copied (default)");
-        printFeedback("§f/cape unlock §7- Allow any player to copy your cape");
+        printFeedback("§f/cape lock §7- Block other players from copying your cape (default)");
+        printFeedback("§f/cape unlock §7- Allow other players to copy your cape");
+        printFeedback("§f/cape blockcopy <player> §7- Block a specific player from copying your cape");
+        printFeedback("§f/cape unblockcopy <player> §7- Unblock a player from copying your cape");
         printFeedback("§f/friend add <player> §7- Add a friend so they can automatically copy your cape");
         printFeedback("§f/friend remove <player> §7- Remove a player from your friends list");
         printFeedback("§f/friend list §7- View your friends list");
-        printFeedback("§f/cape report <player> [reason] §7- Report an inappropriate cape to moderation");
+        printFeedback("§f/cape report <player> [reason] §7- Report an inappropriate cape");
         printFeedback("§f/cape block <player> §7- Block a player so you never see their cape");
         printFeedback("§f/cape unblock <player> §7- Unblock a player");
         printFeedback("§f/cape blocklist §7- View your blocked players list");
-        printFeedback("§f/whitelist §7- Add a player to the whitelist");
-        printFeedback("§f/unwhitelist <player> §7- Remove a player from the whitelist");
         printFeedback("§f/auth <key> §7- Authenticate yourself");
         if (AnimaCapesConfig.getInstance().isAdmin()) {
-            printFeedback("§cType /admin help to view administrator commands.");
+            printFeedback("§c[Admin] Type /admin help to view administrator commands.");
         }
     }
 
     public static void printAdminHelp() {
         printFeedback("§c=== Animated Capes Admin Commands ===");
         printFeedback("§f/admin auth <key> §7- Authenticate yourself");
-        printFeedback("§f/admin lookup <player> §7- Look up player cape metadata & moderation status");
-        printFeedback("§f/admin purge <player> §7- Purge a player's cape globally from cloud");
-        printFeedback("§f/admin ban <player> [reason] §7- Ban a player without purging cape");
+        printFeedback("§f/whitelist <player> §7- Add a player to the whitelist");
+        printFeedback("§f/unwhitelist <player> §7- Remove a player from the whitelist");
+        printFeedback("§f/admin lookup <player> §7- Look up a player and view their cape");
+        printFeedback("§f/admin purge <player> §7- Purge a player's cape globally");
+        printFeedback("§f/admin ban <player> [reason] §7- Ban a player (does not purge cape)");
         printFeedback("§f/admin unban <player> §7- Unban a player");
         printFeedback("§f/admin banlist §7- View banned players list");
-        printFeedback("§f/admin whitelist add <player> §7- Add a player to the whitelist");
-        printFeedback("§f/admin whitelist remove <player> §7- Remove a player from the whitelist");
-        printFeedback("§f/admin status §7- View backend cloud status & webhook configuration");
+        printFeedback("§f/admin status §7- View cloud backend & webhook status");
     }
 
     public static void printFeedback(String msg) {

@@ -8,6 +8,10 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
 
 public class AnimaCapesConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -24,9 +28,10 @@ public class AnimaCapesConfig {
     public String backendUrl = "https://animated-capes.officerpot10.workers.dev";
     public String adminKey = "";
     public float animationSpeed = 1.0f; // 0.25f to 3.0f, default 1.0f
-    public java.util.List<String> blockedUsers = new java.util.ArrayList<>();
+    public List<String> blockedUsers = new ArrayList<>();
     public boolean allowCapeCopy = false; // Locked by default (players cannot copy other players' capes)
-    public java.util.List<String> friends = new java.util.ArrayList<>();
+    public List<String> friends = new ArrayList<>();
+    public List<String> copyBlockedUsers = new ArrayList<>();
 
     public boolean isAdmin() {
         return adminKey != null && !adminKey.trim().isEmpty();
@@ -45,7 +50,7 @@ public class AnimaCapesConfig {
 
     public boolean addFriend(String nameOrUuid) {
         if (nameOrUuid == null || nameOrUuid.trim().isEmpty()) return false;
-        if (friends == null) friends = new java.util.ArrayList<>();
+        if (friends == null) friends = new ArrayList<>();
         String clean = nameOrUuid.trim();
         if (!isFriend(clean)) {
             friends.add(clean);
@@ -65,9 +70,62 @@ public class AnimaCapesConfig {
         return removed;
     }
 
-    public java.util.List<String> getFriends() {
-        if (friends == null) friends = new java.util.ArrayList<>();
-        return new java.util.ArrayList<>(friends);
+    public List<String> getFriends() {
+        if (friends == null) friends = new ArrayList<>();
+        return new ArrayList<>(friends);
+    }
+
+    public boolean isCopyBlocked(String nameOrUuid) {
+        if (nameOrUuid == null || copyBlockedUsers == null || copyBlockedUsers.isEmpty()) return false;
+        String clean = nameOrUuid.trim().toLowerCase();
+        for (String b : copyBlockedUsers) {
+            if (b != null && b.trim().equalsIgnoreCase(clean)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean blockCopyUser(String nameOrUuid) {
+        if (nameOrUuid == null || nameOrUuid.trim().isEmpty()) return false;
+        if (copyBlockedUsers == null) copyBlockedUsers = new ArrayList<>();
+        String clean = nameOrUuid.trim();
+        if (!isCopyBlocked(clean)) {
+            copyBlockedUsers.add(clean);
+            save();
+            return true;
+        }
+        return false;
+    }
+
+    public boolean unblockCopyUser(String nameOrUuid) {
+        if (nameOrUuid == null || copyBlockedUsers == null || copyBlockedUsers.isEmpty()) return false;
+        String clean = nameOrUuid.trim().toLowerCase();
+        boolean removed = copyBlockedUsers.removeIf(b -> b != null && b.trim().equalsIgnoreCase(clean));
+        if (removed) {
+            save();
+        }
+        return removed;
+    }
+
+    public List<String> getCopyBlockedUsers() {
+        if (copyBlockedUsers == null) copyBlockedUsers = new ArrayList<>();
+        return new ArrayList<>(copyBlockedUsers);
+    }
+
+    public List<String> getEffectiveCopyBlockedUsers() {
+        Set<String> set = new LinkedHashSet<>();
+        if (copyBlockedUsers != null) {
+            for (String s : copyBlockedUsers) {
+                if (s != null && !s.trim().isEmpty()) set.add(s.trim());
+            }
+        }
+        if (blockedUsers != null) {
+            for (String s : blockedUsers) {
+                if (s != null && !s.trim().isEmpty()) set.add(s.trim());
+            }
+        }
+        return new ArrayList<>(set);
     }
 
     public boolean isBlocked(String uuidOrName) {
@@ -90,7 +148,7 @@ public class AnimaCapesConfig {
 
     public boolean blockUser(String nameOrUuid) {
         if (nameOrUuid == null || nameOrUuid.trim().isEmpty()) return false;
-        if (blockedUsers == null) blockedUsers = new java.util.ArrayList<>();
+        if (blockedUsers == null) blockedUsers = new ArrayList<>();
         String clean = nameOrUuid.trim();
         if (!isBlocked(clean)) {
             blockedUsers.add(clean);
@@ -110,9 +168,9 @@ public class AnimaCapesConfig {
         return removed;
     }
 
-    public java.util.List<String> getBlockedUsers() {
-        if (blockedUsers == null) blockedUsers = new java.util.ArrayList<>();
-        return new java.util.ArrayList<>(blockedUsers);
+    public List<String> getBlockedUsers() {
+        if (blockedUsers == null) blockedUsers = new ArrayList<>();
+        return new ArrayList<>(blockedUsers);
     }
 
     public float getAnimationSpeed() {
@@ -149,12 +207,9 @@ public class AnimaCapesConfig {
             try (FileReader reader = new FileReader(configFile)) {
                 AnimaCapesConfig config = GSON.fromJson(reader, AnimaCapesConfig.class);
                 if (config != null) {
-                    if (config.blockedUsers == null) {
-                        config.blockedUsers = new java.util.ArrayList<>();
-                    }
-                    if (config.friends == null) {
-                        config.friends = new java.util.ArrayList<>();
-                    }
+                    if (config.blockedUsers == null) config.blockedUsers = new ArrayList<>();
+                    if (config.friends == null) config.friends = new ArrayList<>();
+                    if (config.copyBlockedUsers == null) config.copyBlockedUsers = new ArrayList<>();
                     if (config.backendUrl == null || config.backendUrl.trim().isEmpty() || config.backendUrl.contains("localhost") || config.backendUrl.contains("fly.dev")) {
                         config.backendUrl = "https://animated-capes.officerpot10.workers.dev";
                         config.save();

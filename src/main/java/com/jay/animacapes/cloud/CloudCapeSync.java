@@ -1,5 +1,7 @@
 package com.jay.animacapes.cloud;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import com.jay.animacapes.config.AnimaCapesConfig;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.User;
@@ -31,6 +33,7 @@ public class CloudCapeSync {
     private volatile Status status = Status.IDLE;
     private volatile String lastSyncedHash = "";
     private volatile String errorMessage = "";
+    private volatile boolean whitelistedAccount = false;
 
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(6))
@@ -49,6 +52,14 @@ public class CloudCapeSync {
 
     public Status getStatus() {
         return status;
+    }
+
+    public boolean isWhitelistedAccount() {
+        return whitelistedAccount;
+    }
+
+    public void setWhitelistedAccount(boolean whitelisted) {
+        this.whitelistedAccount = whitelisted;
     }
 
     public String getErrorMessage() {
@@ -72,6 +83,83 @@ public class CloudCapeSync {
         } catch (Exception e) {
             return "";
         }
+    }
+
+    public void refreshWhitelistStatusAsync() {
+        executor.submit(() -> {
+            try {
+                Minecraft mc = Minecraft.getInstance();
+                User user = (mc != null) ? mc.getUser() : null;
+                UUID uuid = (user != null) ? user.getProfileId() : null;
+                String username = (user != null) ? user.getName() : null;
+                if (uuid == null && username == null) return;
+
+                AnimaCapesConfig cfg = AnimaCapesConfig.getInstance();
+                String baseBackend = cfg.backendUrl;
+                if (baseBackend == null || baseBackend.trim().isEmpty()) return;
+                if (baseBackend.endsWith("/")) baseBackend = baseBackend.substring(0, baseBackend.length() - 1);
+
+                HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
+                        .uri(URI.create(baseBackend + "/whitelist"))
+                        .timeout(Duration.ofSeconds(6))
+                        .header("User-Agent", "AnimatedCapes-MinecraftMod/1.0.0 (Fabric)")
+                        .GET();
+
+                if (username != null) reqBuilder.header("X-Player-Name", username);
+                if (uuid != null) reqBuilder.header("X-Player-UUID", uuid.toString());
+                if (cfg.isAdmin()) reqBuilder.header("X-Admin-Secret", cfg.adminKey.trim());
+
+                HttpResponse<String> resp = httpClient.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
+                this.whitelistedAccount = (resp.statusCode() == 200);
+            } catch (Throwable ignored) {}
+        });
+    }
+
+    public void syncPrivacySettingsAsync() {
+        if (!AnimaCapesConfig.getInstance().cloudSyncEnabled) return;
+
+        executor.submit(() -> {
+            try {
+                Minecraft mc = Minecraft.getInstance();
+                User user = (mc != null) ? mc.getUser() : null;
+                UUID uuid = (user != null) ? user.getProfileId() : null;
+                String username = (user != null) ? user.getName() : "Player";
+                if (uuid == null) return;
+
+                AnimaCapesConfig cfg = AnimaCapesConfig.getInstance();
+                String baseBackend = cfg.backendUrl;
+                if (baseBackend == null || baseBackend.trim().isEmpty()) return;
+                if (baseBackend.endsWith("/")) baseBackend = baseBackend.substring(0, baseBackend.length() - 1);
+
+                JsonObject body = new JsonObject();
+                body.addProperty("playerName", username);
+                body.addProperty("allowCopy", cfg.allowCapeCopy);
+
+                JsonArray friendsArr = new JsonArray();
+                for (String f : cfg.getFriends()) {
+                    friendsArr.add(f);
+                }
+                body.add("friends", friendsArr);
+
+                JsonArray blockedArr = new JsonArray();
+                for (String b : cfg.getEffectiveCopyBlockedUsers()) {
+                    blockedArr.add(b);
+                }
+                body.add("copyBlocked", blockedArr);
+
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(baseBackend + "/capes/privacy/" + uuid.toString()))
+                        .timeout(Duration.ofSeconds(8))
+                        .header("User-Agent", "AnimatedCapes-MinecraftMod/1.0.0 (Fabric)")
+                        .header("Content-Type", "application/json")
+                        .header("X-Player-UUID", uuid.toString())
+                        .header("X-Player-Name", username)
+                        .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                        .build();
+
+                httpClient.send(req, HttpResponse.BodyHandlers.discarding());
+            } catch (Throwable ignored) {}
+        });
     }
 
     public void syncCurrentCapeAsync(File capeFile) {
@@ -135,7 +223,8 @@ public class CloudCapeSync {
                     return;
                 }
 
-                String baseBackend = AnimaCapesConfig.getInstance().backendUrl;
+                AnimaCapesConfig cfg = AnimaCapesConfig.getInstance();
+                String baseBackend = cfg.backendUrl;
                 if (baseBackend == null || baseBackend.trim().isEmpty()) {
                     this.status = Status.ERROR;
                     this.errorMessage = "Backend URL not configured";
@@ -153,15 +242,15 @@ public class CloudCapeSync {
                     File opt = com.jay.animacapes.codec.WebpOptimizer.optimizeGifToWebp(fileToUpload, com.jay.animacapes.gui.GalleryFolder.getFolder());
                     if (opt != null && opt.exists() && opt.length() > 0 && opt.length() < fileToUpload.length()) {
                         fileToUpload = opt;
-                        com.jay.animacapes.config.AnimaCapesConfig.getInstance().capeFilePath = opt.getAbsolutePath();
-                        com.jay.animacapes.config.AnimaCapesConfig.getInstance().save();
+                        cfg.capeFilePath = opt.getAbsolutePath();
+                        cfg.save();
                     }
                 } else if (lowerName.endsWith(".png") || lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg")) {
                     File opt = com.jay.animacapes.codec.WebpOptimizer.optimizeStaticImageToLosslessWebp(fileToUpload, com.jay.animacapes.gui.GalleryFolder.getFolder());
                     if (opt != null && opt.exists() && opt.length() > 0 && opt.length() < fileToUpload.length()) {
                         fileToUpload = opt;
-                        com.jay.animacapes.config.AnimaCapesConfig.getInstance().capeFilePath = opt.getAbsolutePath();
-                        com.jay.animacapes.config.AnimaCapesConfig.getInstance().save();
+                        cfg.capeFilePath = opt.getAbsolutePath();
+                        cfg.save();
                     }
                 }
 
@@ -178,13 +267,15 @@ public class CloudCapeSync {
                         .header("X-Player-Name", username)
                         .header("X-Cape-Hash", actualHash)
                         .header("X-File-Name", fileToUpload.getName())
-                        .header("X-Cape-Allow-Copy", String.valueOf(AnimaCapesConfig.getInstance().allowCapeCopy))
-                        .header("X-Cape-Friends", String.join(",", AnimaCapesConfig.getInstance().getFriends()))
+                        .header("X-Cape-Allow-Copy", String.valueOf(cfg.allowCapeCopy))
+                        .header("X-Cape-Friends", String.join(",", cfg.getFriends()))
+                        .header("X-Cape-Copy-Blocked", String.join(",", cfg.getEffectiveCopyBlockedUsers()))
                         .POST(HttpRequest.BodyPublishers.ofByteArray(fileBytes));
 
-                String adminKey = AnimaCapesConfig.getInstance().adminKey;
+                String adminKey = cfg.adminKey;
                 if (adminKey != null && !adminKey.trim().isEmpty()) {
                     reqBuilder.header("X-Admin-Key", adminKey.trim());
+                    reqBuilder.header("X-Admin-Secret", adminKey.trim());
                     reqBuilder.header("Authorization", "Bearer " + adminKey.trim());
                 }
 
@@ -194,7 +285,6 @@ public class CloudCapeSync {
                     this.status = Status.SYNCED;
                     System.out.println("[AnimatedCapes] Cape synced to cloud successfully for " + username + " (" + uuid + ")");
                 } else if (resp.statusCode() == 403 && originalGif != null && originalGif.exists()) {
-                    // Fallback to uploading raw GIF directly since server whitelists GIF for all users
                     System.out.println("[AnimatedCapes] WebP upload returned 403 (whitelist required). Falling back to GIF upload...");
                     byte[] gifBytes = Files.readAllBytes(originalGif.toPath());
                     String gifHash = computeFileSha256(originalGif);
@@ -207,12 +297,14 @@ public class CloudCapeSync {
                             .header("X-Player-Name", username)
                             .header("X-Cape-Hash", gifHash)
                             .header("X-File-Name", originalGif.getName())
-                            .header("X-Cape-Allow-Copy", String.valueOf(AnimaCapesConfig.getInstance().allowCapeCopy))
-                            .header("X-Cape-Friends", String.join(",", AnimaCapesConfig.getInstance().getFriends()))
+                            .header("X-Cape-Allow-Copy", String.valueOf(cfg.allowCapeCopy))
+                            .header("X-Cape-Friends", String.join(",", cfg.getFriends()))
+                            .header("X-Cape-Copy-Blocked", String.join(",", cfg.getEffectiveCopyBlockedUsers()))
                             .POST(HttpRequest.BodyPublishers.ofByteArray(gifBytes));
 
                     if (adminKey != null && !adminKey.trim().isEmpty()) {
                         gifReqBuilder.header("X-Admin-Key", adminKey.trim());
+                        gifReqBuilder.header("X-Admin-Secret", adminKey.trim());
                         gifReqBuilder.header("Authorization", "Bearer " + adminKey.trim());
                     }
 

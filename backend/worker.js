@@ -1,22 +1,23 @@
 /**
  * Animated Capes Cloud Sync - Cloudflare Worker
- * 
+ *
  * Features:
  *   - Automatic Mojang API resolution: Usernames resolve to permanent UUIDs so name changes never grant access to anyone else
- *   - In-game owner commands: /whitelist, /unwhitelist, /ban, /unban, /banlist
- *   - Global Cape Purge: Banning a player instantly wipes their cape across all servers
- *   - Strict Whitelist: Only whitelisted accounts can upload Animated WebP (Static WebP, GIF, PNG, JPG open to all)
- *   - Dual Storage Engine: Backblaze B2 (10 GB Free) with automatic Cloudflare KV Cache & fallback
+ *   - Separated Admin API (/admin/whitelist, /admin/ban, /admin/lookup, /admin/purge, /admin/webhook, /admin/reports)
+ *   - Restricted Whitelist Viewing: Only the owner or whitelisted players can view /whitelist
+ *   - Decoupled Ban & Global Purge: Banning blocks uploads while preserving cape for review; /admin/purge wipes cape globally
+ *   - Cape Copy Protection & Friends: Locked by default; friends automatically bypass copy lock; live privacy sync endpoint
+ *   - 30-Cape Anti-Spam Shield: Concise "Upload limit reached!" response; whitelisted & admin accounts bypass limit
+ *   - Discord Moderation Integration: 1-click HTML moderation actions & authenticated /discord/command + /discord/interactions
+ *   - Dual Storage Engine: Backblaze B2 (10 GB) with automatic Cloudflare KV Edge Cache & fallback
  */
 
 async function resolveMojangProfile(input) {
   if (!input) return null;
   const clean = input.trim();
-  // If already formatted UUID
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean)) {
     return { uuid: clean.toLowerCase(), name: clean };
   }
-  // Try Mojang API
   try {
     const resp = await fetch(`https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(clean)}`, {
       headers: { 'User-Agent': 'AnimatedCapes-Edge/1.0' },
@@ -29,6 +30,34 @@ async function resolveMojangProfile(input) {
     }
   } catch (e) {}
   return { uuid: clean.toLowerCase(), name: clean };
+}
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function checkIsAdmin(request, url, env, bodySecret) {
+  const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
+  const candidates = [
+    request.headers.get('X-Admin-Secret'),
+    request.headers.get('X-Admin-Key'),
+    (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, ''),
+    url.searchParams.get('secret'),
+    bodySecret,
+  ]
+    .filter(Boolean)
+    .map(s => String(s).trim());
+
+  for (const c of candidates) {
+    if (c === adminSecret) return true;
+    if (env.ADMIN_KEY && c === env.ADMIN_KEY) return true;
+  }
+  return false;
 }
 
 // --- Backblaze B2 Storage Connector ---
@@ -124,6 +153,93 @@ async function fetchFromB2(env, fileName) {
   return await resp.arrayBuffer();
 }
 
+async function checkCopyPermission(kv, request, url, env, targetUuid, targetName, meta) {
+  const isCopy = (request.headers.get('X-Copy-Request') === 'true') || (url.searchParams.get('copy') === 'true');
+  if (!isCopy) {
+    return { allowed: true };
+  }
+
+  if (checkIsAdmin(request, url, env)) {
+    return { allowed: true };
+  }
+
+  const reqName = (request.headers.get('X-Requester-User') || url.searchParams.get('requester') || '').toLowerCase().trim();
+  const reqUuid = (request.headers.get('X-Player-UUID') || '').toLowerCase().trim();
+
+  const normTargetUuid = (targetUuid || '').toLowerCase().trim();
+  const normTargetName = (targetName || (meta && meta.playerName) || '').toLowerCase().trim();
+
+  if ((reqUuid && normTargetUuid && reqUuid === normTargetUuid) || (reqName && normTargetName && reqName === normTargetName)) {
+    return { allowed: true };
+  }
+
+  let privacy = null;
+  if (normTargetUuid) {
+    privacy = await kv.get(`privacy:${normTargetUuid}`, { type: 'json' });
+  }
+  if (!privacy && normTargetName) {
+    privacy = await kv.get(`privacy:${normTargetName}`, { type: 'json' });
+  }
+
+  const copyBlocked = new Set([
+    ...((privacy && Array.isArray(privacy.copyBlocked)) ? privacy.copyBlocked : []),
+    ...((meta && Array.isArray(meta.copyBlocked)) ? meta.copyBlocked : []),
+  ].map(s => String(s).toLowerCase().trim()).filter(Boolean));
+
+  if ((reqName && copyBlocked.has(reqName)) || (reqUuid && copyBlocked.has(reqUuid))) {
+    return {
+      allowed: false,
+      error: `Player '${targetName || normTargetUuid}' has blocked you from copying their cape.`,
+    };
+  }
+
+  const friends = new Set([
+    ...((privacy && Array.isArray(privacy.friends)) ? privacy.friends : []),
+    ...((meta && Array.isArray(meta.friends)) ? meta.friends : []),
+  ].map(s => String(s).toLowerCase().trim()).filter(Boolean));
+
+  if ((reqName && friends.has(reqName)) || (reqUuid && friends.has(reqUuid))) {
+    return { allowed: true };
+  }
+
+  // Default is false (locked) unless explicitly set to true
+  const allowCopy = (privacy && privacy.allowCopy !== undefined)
+    ? (privacy.allowCopy === true)
+    : (meta && meta.allowCopy === true);
+
+  if (allowCopy) {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    error: `Player '${targetName || normTargetUuid}' has locked their cape from being copied. Add each other with /friend add <player> to copy capes!`,
+  };
+}
+
+async function purgePlayerCape(kv, profile) {
+  const uuidKey = profile.uuid.toLowerCase();
+  const nameKey = profile.name ? profile.name.toLowerCase() : '';
+  let meta = await kv.get(`player:${uuidKey}`, { type: 'json' });
+  if (!meta && nameKey) {
+    meta = await kv.get(`player:${nameKey}`, { type: 'json' });
+  }
+
+  if (meta && meta.hash) {
+    let userCapes = (await kv.get(`user_capes:${uuidKey}`, { type: 'json' })) || [];
+    if (Array.isArray(userCapes)) {
+      userCapes = userCapes.filter(h => h !== meta.hash);
+      await kv.put(`user_capes:${uuidKey}`, JSON.stringify(userCapes));
+    }
+  }
+
+  await kv.delete(`player:${uuidKey}`);
+  if (nameKey) {
+    await kv.delete(`player:${nameKey}`);
+  }
+  return meta;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const kv = env.CAPES_KV || env.capes_kv || env['animated-capes-storage'] || env.animated_capes_storage || env.STORAGE || env.KV;
@@ -164,26 +280,23 @@ export default {
       );
     }
 
-    // 1.5 Whitelist Read Endpoint (/whitelist - Owner & Whitelisted only)
+    // 1.5 Whitelist Read Endpoint (/whitelist - Strictly Owner & Whitelisted Members Only)
     if (path === '/whitelist' && method === 'GET') {
       const kvList = (await kv.get('whitelist:animated_webp', { type: 'json' })) || [];
       const envList = (env.ANIMATED_WEBP_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean);
       const combined = Array.from(new Set(['officerpot10', ...envList, ...kvList]));
 
-      const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
-      const secret = request.headers.get('X-Admin-Secret') || request.headers.get('X-Admin-Key') || url.searchParams.get('secret') || '';
-      const isAdmin = (secret === adminSecret) || (env.ADMIN_KEY && secret === env.ADMIN_KEY) || secret.includes('secret_test_pot10');
-
+      const isAdmin = checkIsAdmin(request, url, env);
       const reqUuid = (request.headers.get('X-Player-UUID') || '').toLowerCase().trim();
       const reqName = (request.headers.get('X-Player-Name') || request.headers.get('X-Requester-User') || url.searchParams.get('user') || '').toLowerCase().trim();
       const isWhitelisted = combined.some(u => {
-        const clean = u.toLowerCase().trim();
+        const clean = String(u).toLowerCase().trim();
         return (reqUuid && clean === reqUuid) || (reqName && clean === reqName);
       });
 
       if (!isAdmin && !isWhitelisted) {
         return new Response(JSON.stringify({
-          error: 'Access Denied: Only whitelisted members and the owner can view the whitelist.'
+          error: 'Access Denied: Only the owner or whitelisted players can view the whitelist.'
         }), {
           status: 403,
           headers: corsHeaders,
@@ -193,17 +306,23 @@ export default {
       return new Response(JSON.stringify({ combinedList: combined }), { headers: corsHeaders });
     }
 
+    // 1.6 Banlist Read Endpoint (Admin Only)
     if (path === '/banlist' && method === 'GET') {
+      if (!checkIsAdmin(request, url, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized: Admin access only' }), {
+          status: 401,
+          headers: corsHeaders,
+        });
+      }
       const banList = (await kv.get('banned:players', { type: 'json' })) || [];
       return new Response(JSON.stringify({ bannedList: banList }), { headers: corsHeaders });
     }
 
-    // 2. Owner-Only Admin API (/admin/whitelist and /admin/ban)
+    // 2. Owner-Only Admin API (/admin/*)
     const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
     if (path.startsWith('/admin/')) {
-      const secret = request.headers.get('X-Admin-Secret') || url.searchParams.get('secret');
-      if (secret !== adminSecret) {
-        return new Response(JSON.stringify({ error: 'Unauthorized: Owner access only' }), {
+      if (!checkIsAdmin(request, url, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized: Admin access only' }), {
           status: 401,
           headers: corsHeaders,
         });
@@ -231,7 +350,7 @@ export default {
           const profile = await resolveMojangProfile(target);
           if (!kvList.some(u => u.toLowerCase() === profile.uuid.toLowerCase())) {
             kvList.push(profile.uuid);
-            if (profile.name && profile.name !== profile.uuid) {
+            if (profile.name && profile.name !== profile.uuid && !kvList.some(u => u.toLowerCase() === profile.name.toLowerCase())) {
               kvList.push(profile.name);
             }
             await kv.put('whitelist:animated_webp', JSON.stringify(kvList));
@@ -254,28 +373,48 @@ export default {
       if (path === '/admin/ban' || path.startsWith('/admin/ban/')) {
         let banList = (await kv.get('banned:players', { type: 'json' })) || [];
 
-        if (method === 'GET') {
+        // Support GET /admin/ban (returns banlist) AND GET /admin/ban?user=<player> (Discord 1-click ban)
+        if (method === 'GET' && !url.searchParams.get('user')) {
           return new Response(JSON.stringify({ bannedList: banList }), { headers: corsHeaders });
         }
 
-        if (method === 'POST') {
-          const body = await request.json().catch(() => ({}));
+        if (method === 'POST' || (method === 'GET' && url.searchParams.get('user'))) {
+          const body = method === 'POST' ? (await request.json().catch(() => ({}))) : {};
           const target = (body.user || body.uuid || url.searchParams.get('user') || '').trim();
           if (!target) return new Response(JSON.stringify({ error: 'Missing user' }), { status: 400, headers: corsHeaders });
 
           const profile = await resolveMojangProfile(target);
           if (!banList.some(u => u.toLowerCase() === profile.uuid.toLowerCase())) {
             banList.push(profile.uuid);
-            if (profile.name && profile.name !== profile.uuid) {
+            if (profile.name && profile.name !== profile.uuid && !banList.some(u => u.toLowerCase() === profile.name.toLowerCase())) {
               banList.push(profile.name);
             }
             await kv.put('banned:players', JSON.stringify(banList));
           }
 
-          // User requirement: Banning a player preserves cape in database for review; use /admin purge to wipe
-          // Active cape is not automatically purged.
+          // Banning does NOT automatically purge the player's cape globally.
+          const accept = request.headers.get('Accept') || '';
+          if (method === 'GET' && accept.includes('text/html')) {
+            const purgeLink = `${url.origin}/admin/purge?user=${encodeURIComponent(profile.uuid)}&secret=${encodeURIComponent(adminSecret)}`;
+            const lookupLink = `${url.origin}/admin/lookup?user=${encodeURIComponent(profile.uuid)}&secret=${encodeURIComponent(adminSecret)}`;
+            return new Response(`<!DOCTYPE html><html><body style="font-family:sans-serif;background:#18181b;color:#f4f4f5;padding:40px;text-align:center;">
+              <h1 style="color:#ef4444;">🔨 Player Banned</h1>
+              <p><b>${escapeHtml(profile.name)}</b> (<code>${escapeHtml(profile.uuid)}</code>) is now banned from uploading capes.</p>
+              <p style="color:#a1a1aa;">Their current cape was preserved in the database for review.</p>
+              <p style="margin-top:24px;">
+                <a href="${lookupLink}" style="background:#3b82f6;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;margin-right:10px;">🔍 View Player & Cape</a>
+                <a href="${purgeLink}" style="background:#dc2626;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;">🗑️ Purge Cape Globally</a>
+              </p>
+            </body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+          }
 
-          return new Response(JSON.stringify({ success: true, banned: true, name: profile.name, uuid: profile.uuid }), { headers: corsHeaders });
+          return new Response(JSON.stringify({
+            success: true,
+            banned: true,
+            capePreserved: true,
+            name: profile.name,
+            uuid: profile.uuid,
+          }), { headers: corsHeaders });
         }
 
         if (method === 'DELETE') {
@@ -322,21 +461,57 @@ export default {
 
       // --- E. Admin Player Lookup (/admin/lookup or /admin/cape) ---
       if (path === '/admin/lookup' || path === '/admin/cape') {
-        const target = (url.searchParams.get('user') || '').trim();
+        let target = (url.searchParams.get('user') || '').trim();
+        if (!target && method === 'POST') {
+          const body = await request.json().catch(() => ({}));
+          target = (body.user || body.uuid || '').trim();
+        }
         if (!target) {
           return new Response(JSON.stringify({ error: 'Missing user parameter' }), { status: 400, headers: corsHeaders });
         }
+
         const profile = await resolveMojangProfile(target);
         const banList = ((await kv.get('banned:players', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
         const isBanned = banList.includes(profile.uuid.toLowerCase()) || (profile.name && banList.includes(profile.name.toLowerCase()));
 
         const kvList = ((await kv.get('whitelist:animated_webp', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
         const envList = (env.ANIMATED_WEBP_WHITELIST || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-        const isWhitelisted = kvList.includes(profile.uuid.toLowerCase()) || envList.includes(profile.uuid.toLowerCase()) || (profile.name && (kvList.includes(profile.name.toLowerCase()) || envList.includes(profile.name.toLowerCase())));
+        const whitelistSet = new Set(['officerpot10', ...envList, ...kvList]);
+        const isWhitelisted = whitelistSet.has(profile.uuid.toLowerCase()) || (profile.name && whitelistSet.has(profile.name.toLowerCase()));
 
         let meta = await kv.get(`player:${profile.uuid.toLowerCase()}`, { type: 'json' });
         if (!meta && profile.name) {
           meta = await kv.get(`player:${profile.name.toLowerCase()}`, { type: 'json' });
+        }
+        const privacy = (await kv.get(`privacy:${profile.uuid.toLowerCase()}`, { type: 'json' })) || {};
+        const allowCopy = (privacy.allowCopy !== undefined) ? (privacy.allowCopy === true) : (meta ? meta.allowCopy === true : false);
+        const capeUrl = meta ? `${url.origin}/capes/file/${meta.hash}` : null;
+
+        const accept = request.headers.get('Accept') || '';
+        if (method === 'GET' && accept.includes('text/html')) {
+          const purgeLink = `${url.origin}/admin/purge?user=${encodeURIComponent(profile.uuid)}&secret=${encodeURIComponent(adminSecret)}`;
+          const banLink = `${url.origin}/admin/ban?user=${encodeURIComponent(profile.uuid)}&secret=${encodeURIComponent(adminSecret)}`;
+          return new Response(`<!DOCTYPE html><html><body style="font-family:sans-serif;background:#18181b;color:#f4f4f5;padding:40px;max-width:640px;margin:0 auto;">
+            <h1 style="color:#38bdf8;margin-bottom:8px;">🔍 Player Moderation Lookup</h1>
+            <div style="background:#27272a;padding:24px;border-radius:10px;border:1px solid #3f3f46;">
+              <p><b>Username:</b> ${escapeHtml(profile.name)}</p>
+              <p><b>UUID:</b> <code>${escapeHtml(profile.uuid)}</code></p>
+              <p><b>Moderation Status:</b> ${isBanned ? '<span style="color:#ef4444;font-weight:bold;">BANNED</span>' : '<span style="color:#22c55e;font-weight:bold;">ACTIVE</span>'}</p>
+              <p><b>Whitelist Status:</b> ${isWhitelisted ? '<span style="color:#f59e0b;font-weight:bold;">WHITELISTED</span>' : 'Standard'}</p>
+              <p><b>Copy Permission:</b> ${allowCopy ? 'Public' : 'Locked (Friends Only)'}</p>
+              ${capeUrl ? `
+                <div style="margin:20px 0;text-align:center;background:#18181b;padding:16px;border-radius:8px;">
+                  <p style="margin-top:0;color:#a1a1aa;">Equipped Cape (${escapeHtml(meta.fileName || 'cape.webp')})</p>
+                  <img src="${capeUrl}" alt="Player Cape" style="max-width:320px;max-height:320px;image-rendering:pixelated;border:1px solid #52525b;" />
+                  <p style="margin-bottom:0;"><a href="${capeUrl}" target="_blank" style="color:#38bdf8;">Open Raw Cape File</a></p>
+                </div>
+              ` : '<p style="color:#a1a1aa;"><i>No active cape equipped in cloud.</i></p>'}
+              <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
+                ${capeUrl ? `<a href="${purgeLink}" style="background:#dc2626;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;font-weight:bold;">🗑️ Purge Cape Globally</a>` : ''}
+                ${!isBanned ? `<a href="${banLink}" style="background:#ea580c;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none;font-weight:bold;">🔨 Ban Player</a>` : ''}
+              </div>
+            </div>
+          </body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         }
 
         return new Response(JSON.stringify({
@@ -348,12 +523,12 @@ export default {
           hasCape: !!meta,
           cape: meta ? {
             hash: meta.hash,
-            url: `${url.origin}/capes/file/${meta.hash}`,
+            url: capeUrl,
             fileName: meta.fileName || 'cape.webp',
-            allowCopy: meta.allowCopy === true,
-            friends: meta.friends || [],
+            allowCopy: allowCopy,
+            friends: privacy.friends || meta.friends || [],
             updatedAt: meta.updatedAt || null,
-          } : null
+          } : null,
         }), { headers: corsHeaders });
       }
 
@@ -372,22 +547,13 @@ export default {
         }
 
         const profile = await resolveMojangProfile(target);
-        let meta = await kv.get(`player:${profile.uuid.toLowerCase()}`, { type: 'json' });
-        if (!meta && profile.name) {
-          meta = await kv.get(`player:${profile.name.toLowerCase()}`, { type: 'json' });
-        }
-
-        // Delete active cape mapping
-        await kv.delete(`player:${profile.uuid.toLowerCase()}`);
-        if (profile.name) {
-          await kv.delete(`player:${profile.name.toLowerCase()}`);
-        }
+        const meta = await purgePlayerCape(kv, profile);
 
         const accept = request.headers.get('Accept') || '';
         if (accept.includes('text/html')) {
           return new Response(`<!DOCTYPE html><html><body style="font-family:sans-serif;background:#18181b;color:#f4f4f5;padding:40px;text-align:center;">
-            <h1 style="color:#22c55e;">✓ Cape Purged Successfully</h1>
-            <p>Active cape for <b>${profile.name}</b> (<code>${profile.uuid}</code>) has been permanently purged from global cloud sync.</p>
+            <h1 style="color:#22c55e;">✓ Cape Purged Globally</h1>
+            <p>Active cape for <b>${escapeHtml(profile.name)}</b> (<code>${escapeHtml(profile.uuid)}</code>) has been permanently purged from global cloud sync.</p>
           </body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
         }
 
@@ -396,67 +562,98 @@ export default {
           purged: true,
           name: profile.name,
           uuid: profile.uuid,
-          hash: meta ? meta.hash : null
+          hash: meta ? meta.hash : null,
         }), { headers: corsHeaders });
       }
     }
 
-    // 2.85 Discord Server Command Webhook Endpoint (/discord/command or /discord/interactions)
+    // 2.5 Authenticated Discord Server Command & Interactions Endpoint (/discord/command or /discord/interactions)
     if ((path === '/discord/command' || path === '/discord/interactions') && method === 'POST') {
       try {
         const body = await request.json().catch(() => ({}));
+
+        if (!checkIsAdmin(request, url, env, body.secret)) {
+          return new Response(JSON.stringify({ error: 'Unauthorized Discord moderation request' }), {
+            status: 401,
+            headers: corsHeaders,
+          });
+        }
+
+        // Discord Interaction PING handshake
         if (body.type === 1) {
           return new Response(JSON.stringify({ type: 1 }), { headers: corsHeaders });
         }
 
+        const isDiscordInteraction = body.type === 2 && body.data;
         const cmd = (body.command || (body.data && body.data.name) || '').toLowerCase().trim();
-        const args = body.args || (body.data && body.data.options ? body.data.options.map(o => o.value).join(' ') : '') || '';
-        const userArg = (body.user || args || '').trim();
+        const optVal = (body.data && Array.isArray(body.data.options) && body.data.options[0]) ? String(body.data.options[0].value || '') : '';
+        const userArg = String(body.user || body.args || optVal || '').trim();
+
+        const sendReply = (content, embedObj) => {
+          if (isDiscordInteraction) {
+            const data = { content };
+            if (embedObj) data.embeds = [embedObj];
+            return new Response(JSON.stringify({ type: 4, data }), { headers: corsHeaders });
+          }
+          return new Response(JSON.stringify({
+            success: true,
+            response_type: 'in_channel',
+            content,
+            embed: embedObj || null,
+          }), { headers: corsHeaders });
+        };
 
         if (cmd === 'lookup' || cmd === 'view' || cmd === 'cape') {
-          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { headers: corsHeaders });
+          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { status: 400, headers: corsHeaders });
           const prof = await resolveMojangProfile(userArg);
           let meta = await kv.get(`player:${prof.uuid.toLowerCase()}`, { type: 'json' });
           if (!meta && prof.name) meta = await kv.get(`player:${prof.name.toLowerCase()}`, { type: 'json' });
           const banList = ((await kv.get('banned:players', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
           const isBanned = banList.includes(prof.uuid.toLowerCase()) || (prof.name && banList.includes(prof.name.toLowerCase()));
+          const capeUrl = meta ? `${url.origin}/capes/file/${meta.hash}` : null;
 
-          return new Response(JSON.stringify({
-            response_type: 'in_channel',
-            content: `**Player:** ${prof.name} (${prof.uuid})
-**Status:** ${isBanned ? '❌ Banned' : '✅ Active'}
-**Cape:** ${meta ? `${url.origin}/capes/file/${meta.hash}` : 'None'}`,
-            capeUrl: meta ? `${url.origin}/capes/file/${meta.hash}` : null
-          }), { headers: corsHeaders });
+          const embed = {
+            title: `🔍 Cape Lookup: ${prof.name}`,
+            color: isBanned ? 0xED4245 : 0x38BDF8,
+            description: `**UUID:** \`${prof.uuid}\`\n**Status:** ${isBanned ? '❌ Banned' : '✅ Active'}\n**Cape:** ${capeUrl ? `[View Raw Asset](${capeUrl})` : 'None'}`,
+          };
+          if (capeUrl) embed.image = { url: capeUrl };
+
+          return sendReply(
+            `**Player:** ${prof.name} (\`${prof.uuid}\`)\n**Status:** ${isBanned ? '❌ Banned' : '✅ Active'}\n**Cape:** ${capeUrl || 'None'}`,
+            embed
+          );
         }
 
         if (cmd === 'purge' || cmd === 'purgecape') {
-          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { headers: corsHeaders });
+          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { status: 400, headers: corsHeaders });
           const prof = await resolveMojangProfile(userArg);
-          await kv.delete(`player:${prof.uuid.toLowerCase()}`);
-          if (prof.name) await kv.delete(`player:${prof.name.toLowerCase()}`);
-          return new Response(JSON.stringify({
-            response_type: 'in_channel',
-            content: `🗑️ **Purged cape globally for ${prof.name}** (${prof.uuid}).`
-          }), { headers: corsHeaders });
+          await purgePlayerCape(kv, prof);
+          return sendReply(`🗑️ **Purged cape globally for ${prof.name}** (\`${prof.uuid}\`).`);
         }
 
         if (cmd === 'ban') {
-          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { headers: corsHeaders });
+          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { status: 400, headers: corsHeaders });
           const prof = await resolveMojangProfile(userArg);
           let banList = (await kv.get('banned:players', { type: 'json' })) || [];
           if (!banList.some(u => u.toLowerCase() === prof.uuid.toLowerCase())) {
             banList.push(prof.uuid);
-            if (prof.name) banList.push(prof.name);
+            if (prof.name && !banList.some(u => u.toLowerCase() === prof.name.toLowerCase())) banList.push(prof.name);
             await kv.put('banned:players', JSON.stringify(banList));
           }
-          return new Response(JSON.stringify({
-            response_type: 'in_channel',
-            content: `🔨 **Banned player ${prof.name}**. (Cape preserved in database; run /purge ${prof.name} to delete).`
-          }), { headers: corsHeaders });
+          return sendReply(`🔨 **Banned player ${prof.name}** (\`${prof.uuid}\`). Cape preserved in database; run \`purge ${prof.name}\` to remove globally.`);
         }
 
-        return new Response(JSON.stringify({ error: 'Unknown Discord command: ' + cmd }), { headers: corsHeaders });
+        if (cmd === 'unban') {
+          if (!userArg) return new Response(JSON.stringify({ error: 'Please specify a username' }), { status: 400, headers: corsHeaders });
+          const prof = await resolveMojangProfile(userArg);
+          let banList = (await kv.get('banned:players', { type: 'json' })) || [];
+          banList = banList.filter(u => u.toLowerCase() !== prof.uuid.toLowerCase() && u.toLowerCase() !== prof.name.toLowerCase());
+          await kv.put('banned:players', JSON.stringify(banList));
+          return sendReply(`✅ **Unbanned player ${prof.name}** (\`${prof.uuid}\`).`);
+        }
+
+        return new Response(JSON.stringify({ error: 'Unknown Discord command: ' + cmd }), { status: 400, headers: corsHeaders });
       } catch (e) {
         return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
       }
@@ -479,7 +676,6 @@ export default {
         const resolvedUuid = profile ? profile.uuid : reportedUser.toLowerCase();
         const resolvedName = profile ? (profile.name || reportedUser) : reportedUser;
 
-        // Fetch reported user's active cape from KV
         let meta = await kv.get(`player:${resolvedUuid}`, { type: 'json' });
         if (!meta && profile && profile.name) {
           meta = await kv.get(`player:${profile.name.toLowerCase()}`, { type: 'json' });
@@ -494,7 +690,6 @@ export default {
           capeUrl = `${url.origin}/capes/file/${meta.hash}`;
         }
 
-        // Store report record in KV for audit / moderation log
         const reportId = `report:${Date.now()}_${resolvedUuid.substring(0, 8)}`;
         const reportData = {
           id: reportId,
@@ -512,17 +707,19 @@ export default {
         };
         await kv.put(reportId, JSON.stringify(reportData));
 
-        // Send Discord Webhook Notification
         let discordSent = false;
-        let discordError = null;
         const discordWebhookUrl = env.DISCORD_WEBHOOK_URL || (await kv.get('config:discord_webhook'));
 
         if (discordWebhookUrl && discordWebhookUrl.startsWith('https://')) {
           try {
+            const lookupLink = `${url.origin}/admin/lookup?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(adminSecret)}`;
+            const purgeLink = `${url.origin}/admin/purge?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(adminSecret)}`;
+            const banLink = `${url.origin}/admin/ban?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(adminSecret)}`;
+
             const embed = {
               title: '🚨 Animated Cape Report Submitted',
-              description: `A user has submitted a report against **${resolvedName}**.`,
-              color: 0xED4245, // Discord Red
+              description: `A player has reported **${resolvedName}** for an inappropriate cape.`,
+              color: 0xED4245,
               fields: [
                 {
                   name: '👤 Reported Player',
@@ -541,16 +738,16 @@ export default {
                 },
                 {
                   name: '🎨 Active Cape Status',
-                  value: meta ? `• **File:** \`${capeFileName}\`\n• **Hash:** \`${capeHash}\`\n• **Direct Link:** [View / Download Cape](${capeUrl})` : '*No cape currently equipped by this player*',
+                  value: meta
+                    ? `• **File:** \`${capeFileName}\`\n• **Hash:** \`${capeHash}\`\n• **Direct Link:** [View / Download Cape](${capeUrl})`
+                    : '*No cape currently equipped by this player*',
                   inline: false,
                 },
-                                {
+                {
                   name: '🛡️ Moderation Actions (Discord 1-Click)',
-                  value: `[🔍 Look Up Player](${url.origin}/admin/lookup?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(env.ADMIN_SECRET || 'animacapes_admin_pot10')}) • [🗑️ Purge Cape Globally](${url.origin}/admin/purge?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(env.ADMIN_SECRET || 'animacapes_admin_pot10')}) • [🔨 Ban Player](${url.origin}/admin/ban?user=${encodeURIComponent(resolvedName)}&secret=${encodeURIComponent(env.ADMIN_SECRET || 'animacapes_admin_pot10')})`,
+                  value: `[🔍 Look Up Player](${lookupLink}) • [🗑️ Purge Cape Globally](${purgeLink}) • [🔨 Ban Player](${banLink})`,
                   inline: false,
-                }\``,
-                  inline: false,
-                }
+                },
               ],
               footer: {
                 text: 'Animated Capes Moderation System',
@@ -562,25 +759,18 @@ export default {
               embed.image = { url: capeUrl };
             }
 
-            const discordPayload = {
-              username: 'Animated Capes Moderation',
-              avatar_url: 'https://cdn-icons-png.flaticon.com/512/595/595067.png',
-              embeds: [embed],
-            };
-
             const discordResp = await fetch(discordWebhookUrl, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(discordPayload),
+              body: JSON.stringify({
+                username: 'Animated Capes Moderation',
+                avatar_url: 'https://cdn-icons-png.flaticon.com/512/595/595067.png',
+                embeds: [embed],
+              }),
             });
 
             discordSent = discordResp.ok;
-            if (!discordResp.ok) {
-              discordError = `Discord status ${discordResp.status}: ${await discordResp.text()}`;
-              console.error('[Discord Webhook Error]', discordError);
-            }
           } catch (dErr) {
-            discordError = dErr.message;
             console.error('[Discord Webhook Exception]', dErr);
           }
         }
@@ -594,7 +784,9 @@ export default {
             capeUrl: capeUrl,
             discordNotified: discordSent,
             discordConfigured: !!discordWebhookUrl,
-            note: discordSent ? 'Report forwarded to Discord' : (discordWebhookUrl ? 'Discord webhook failed' : 'Report recorded in moderation log (set DISCORD_WEBHOOK_URL to forward to Discord)'),
+            note: discordSent
+              ? 'Report forwarded to Discord'
+              : (discordWebhookUrl ? 'Discord webhook failed' : 'Report recorded in moderation log'),
           }),
           { headers: corsHeaders }
         );
@@ -606,17 +798,67 @@ export default {
       }
     }
 
+    // 2.88 POST /capes/privacy/:uuid (Live sync of cape copy lock, friends & copy-block list)
+    if (path.startsWith('/capes/privacy/') && method === 'POST') {
+      const uuid = path.replace('/capes/privacy/', '').toLowerCase().trim();
+      if (!uuid) {
+        return new Response(JSON.stringify({ error: 'Missing player UUID' }), { status: 400, headers: corsHeaders });
+      }
+
+      const body = await request.json().catch(() => ({}));
+      const playerName = (request.headers.get('X-Player-Name') || body.playerName || '').toLowerCase().trim();
+      const allowCopy = body.allowCopy === true;
+
+      const rawFriends = Array.isArray(body.friends) ? body.friends : [];
+      const resolvedFriends = new Set();
+      for (const f of rawFriends.slice(0, 200)) {
+        const cleanF = String(f || '').toLowerCase().trim();
+        if (!cleanF) continue;
+        resolvedFriends.add(cleanF);
+      }
+
+      const rawBlocked = Array.isArray(body.copyBlocked) ? body.copyBlocked : [];
+      const resolvedBlocked = new Set();
+      for (const b of rawBlocked.slice(0, 200)) {
+        const cleanB = String(b || '').toLowerCase().trim();
+        if (!cleanB) continue;
+        resolvedBlocked.add(cleanB);
+      }
+
+      const privacyPayload = {
+        uuid,
+        playerName,
+        allowCopy,
+        friends: Array.from(resolvedFriends),
+        copyBlocked: Array.from(resolvedBlocked),
+        updatedAt: Date.now(),
+      };
+
+      await kv.put(`privacy:${uuid}`, JSON.stringify(privacyPayload));
+      if (playerName) {
+        await kv.put(`privacy:${playerName}`, JSON.stringify(privacyPayload));
+      }
+
+      // Also sync onto active player cape metadata if present
+      const existingMeta = await kv.get(`player:${uuid}`, { type: 'json' });
+      if (existingMeta) {
+        existingMeta.allowCopy = allowCopy;
+        existingMeta.friends = privacyPayload.friends;
+        existingMeta.copyBlocked = privacyPayload.copyBlocked;
+        await kv.put(`player:${uuid}`, JSON.stringify(existingMeta));
+      }
+
+      return new Response(JSON.stringify({ success: true, allowCopy, friendsCount: privacyPayload.friends.length }), {
+        headers: corsHeaders,
+      });
+    }
+
     // 2.9 GET /capes/by-name/:username (Search player cape by username)
     if (path.startsWith('/capes/by-name/') && method === 'GET') {
       const username = path.replace('/capes/by-name/', '').trim();
       const profile = await resolveMojangProfile(username);
       if (!profile || !profile.uuid) {
         return new Response(JSON.stringify({ error: `Player '${username}' not found` }), { status: 404, headers: corsHeaders });
-      }
-
-      const banList = ((await kv.get('banned:players', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
-      if (banList.includes(profile.uuid.toLowerCase()) || (profile.name && banList.includes(profile.name.toLowerCase()))) {
-        return new Response(JSON.stringify({ error: 'Player is banned' }), { status: 404, headers: corsHeaders });
       }
 
       let meta = await kv.get(`player:${profile.uuid.toLowerCase()}`, { type: 'json' });
@@ -628,23 +870,9 @@ export default {
         return new Response(JSON.stringify({ error: `Player '${profile.name || username}' has no cape equipped` }), { status: 404, headers: corsHeaders });
       }
 
-      // Copy lock check
-      const isCopy = (request.headers.get('X-Copy-Request') === 'true') || (url.searchParams.get('copy') === 'true');
-      if (isCopy && meta.allowCopy === false) {
-        const reqName = (request.headers.get('X-Requester-User') || url.searchParams.get('requester') || '').toLowerCase().trim();
-        const reqUuid = (request.headers.get('X-Player-UUID') || '').toLowerCase().trim();
-        const isSelf = (reqName && profile.name && reqName === profile.name.toLowerCase()) || (reqUuid && reqUuid === profile.uuid.toLowerCase());
-        const friends = Array.isArray(meta.friends) ? meta.friends : [];
-        const isFriend = (reqName && friends.includes(reqName)) || (reqUuid && friends.includes(reqUuid));
-        const secret = request.headers.get('X-Admin-Secret') || request.headers.get('X-Admin-Key') || url.searchParams.get('secret') || '';
-        const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
-        const isAdmin = secret === adminSecret || (env.ADMIN_KEY && secret === env.ADMIN_KEY);
-
-        if (!isSelf && !isFriend && !isAdmin) {
-          return new Response(JSON.stringify({
-            error: `Player '${profile.name || username}' has locked their cape from being copied. You must be friends to wear their cape!`
-          }), { status: 403, headers: corsHeaders });
-        }
+      const copyPerm = await checkCopyPermission(kv, request, url, env, profile.uuid, profile.name || meta.playerName || username, meta);
+      if (!copyPerm.allowed) {
+        return new Response(JSON.stringify({ error: copyPerm.error }), { status: 403, headers: corsHeaders });
       }
 
       const fileUrl = `${url.origin}/capes/file/${meta.hash}`;
@@ -661,26 +889,18 @@ export default {
     }
 
     // 3. GET /capes/:uuid (Query player cape by UUID or username)
-    if (path.startsWith('/capes/') && !path.startsWith('/capes/file/') && method === 'GET') {
+    if (path.startsWith('/capes/') && !path.startsWith('/capes/file/') && !path.startsWith('/capes/privacy/') && method === 'GET') {
       const target = path.replace('/capes/', '').toLowerCase();
-
-      // Check if player is banned
-      const banList = ((await kv.get('banned:players', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
-      if (banList.includes(target)) {
-        return new Response(JSON.stringify({ error: 'Player is banned' }), { status: 404, headers: corsHeaders });
-      }
 
       let meta = await kv.get(`player:${target}`, { type: 'json' });
       let finalUuid = target;
+      let resolvedName = meta ? meta.playerName : '';
 
-      // If not directly found by key and not a formatted UUID, try resolving via Mojang API
       if (!meta && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target)) {
         const prof = await resolveMojangProfile(target);
         if (prof && prof.uuid) {
           finalUuid = prof.uuid;
-          if (banList.includes(prof.uuid.toLowerCase()) || (prof.name && banList.includes(prof.name.toLowerCase()))) {
-            return new Response(JSON.stringify({ error: 'Player is banned' }), { status: 404, headers: corsHeaders });
-          }
+          resolvedName = prof.name || target;
           meta = await kv.get(`player:${prof.uuid.toLowerCase()}`, { type: 'json' });
           if (!meta && prof.name) {
             meta = await kv.get(`player:${prof.name.toLowerCase()}`, { type: 'json' });
@@ -692,23 +912,9 @@ export default {
         return new Response(JSON.stringify({ error: 'No cape equipped' }), { status: 404, headers: corsHeaders });
       }
 
-      // Copy lock check
-      const isCopy = (request.headers.get('X-Copy-Request') === 'true') || (url.searchParams.get('copy') === 'true');
-      if (isCopy && meta.allowCopy === false) {
-        const reqName = (request.headers.get('X-Requester-User') || url.searchParams.get('requester') || '').toLowerCase().trim();
-        const reqUuid = (request.headers.get('X-Player-UUID') || '').toLowerCase().trim();
-        const isSelf = (reqName && meta.playerName && reqName === meta.playerName.toLowerCase()) || (reqUuid && reqUuid === finalUuid.toLowerCase());
-        const friends = Array.isArray(meta.friends) ? meta.friends : [];
-        const isFriend = (reqName && friends.includes(reqName)) || (reqUuid && friends.includes(reqUuid));
-        const secret = request.headers.get('X-Admin-Secret') || request.headers.get('X-Admin-Key') || url.searchParams.get('secret') || '';
-        const adminSecret = env.ADMIN_SECRET || 'animacapes_admin_pot10';
-        const isAdmin = secret === adminSecret || (env.ADMIN_KEY && secret === env.ADMIN_KEY);
-
-        if (!isSelf && !isFriend && !isAdmin) {
-          return new Response(JSON.stringify({
-            error: `Player '${meta.playerName || finalUuid}' has locked their cape from being copied. You must be friends to wear their cape!`
-          }), { status: 403, headers: corsHeaders });
-        }
+      const copyPerm = await checkCopyPermission(kv, request, url, env, finalUuid, resolvedName || meta.playerName || finalUuid, meta);
+      if (!copyPerm.allowed) {
+        return new Response(JSON.stringify({ error: copyPerm.error }), { status: 403, headers: corsHeaders });
       }
 
       const fileUrl = `${url.origin}/capes/file/${meta.hash}`;
@@ -718,7 +924,7 @@ export default {
           hash: meta.hash,
           url: fileUrl,
           fileName: meta.fileName || 'cape.webp',
-          playerName: meta.playerName || 'Player',
+          playerName: meta.playerName || resolvedName || 'Player',
         }),
         { headers: corsHeaders }
       );
@@ -727,16 +933,13 @@ export default {
     // 4. GET /capes/file/:hash (Serve binary cape)
     if (path.startsWith('/capes/file/') && method === 'GET') {
       const hash = path.replace('/capes/file/', '');
-      
-      // 1. Check local edge KV cache first
+
       let fileData = await kv.get(`file:${hash}`, { type: 'arrayBuffer' });
 
-      // 2. If not in KV and Backblaze B2 is configured, fetch from B2
       if (!fileData && isB2Configured(env)) {
         try {
           fileData = await fetchFromB2(env, hash);
           if (fileData) {
-            // Cache in KV for ultra-fast edge hits
             if (ctx && ctx.waitUntil) {
               ctx.waitUntil(kv.put(`file:${hash}`, fileData));
             } else {
@@ -766,8 +969,8 @@ export default {
       });
     }
 
-    // 5. POST /capes/:uuid (Upload cape with ban check & Animated WebP whitelist)
-    if (path.startsWith('/capes/') && method === 'POST') {
+    // 5. POST /capes/:uuid (Upload cape with ban check, 30-cape limit & Animated WebP whitelist)
+    if (path.startsWith('/capes/') && !path.startsWith('/capes/privacy/') && method === 'POST') {
       const uuid = path.replace('/capes/', '').toLowerCase();
       const playerName = request.headers.get('X-Player-Name') || 'Player';
       const fileHash = request.headers.get('X-Cape-Hash') || url.searchParams.get('hash');
@@ -783,9 +986,7 @@ export default {
       }
 
       // 1.5 Anti-Spam Storage Shield: Enforce Max 30 Capes per Player (Whitelisted & Admin members bypass)
-      const adminHeader = request.headers.get('X-Admin-Key') || request.headers.get('Authorization') || '';
-      const isAdmin = (env.ADMIN_KEY && adminHeader.includes(env.ADMIN_KEY)) || (adminHeader.includes('secret_test_pot10'));
-
+      const isAdmin = checkIsAdmin(request, url, env);
       const envList = (env.ANIMATED_WEBP_WHITELIST || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
       const kvList = ((await kv.get('whitelist:animated_webp', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
       const whitelistSet = new Set(['officerpot10', ...envList, ...kvList]);
@@ -886,7 +1087,6 @@ export default {
           });
         }
 
-        // Check if WebP is Animated
         let isAnimatedWebp = false;
         if (view.length >= 24) {
           const firstChunkTag = String.fromCharCode(view[12], view[13], view[14], view[15]);
@@ -896,32 +1096,20 @@ export default {
         }
         if (!isAnimatedWebp) {
           for (let i = 12; i < Math.min(view.length - 4, 1024); i++) {
-            if (view[i] === 0x41 && view[i+1] === 0x4E && view[i+2] === 0x49 && view[i+3] === 0x4D) { // 'ANIM'
+            if (view[i] === 0x41 && view[i + 1] === 0x4E && view[i + 2] === 0x49 && view[i + 3] === 0x4D) {
               isAnimatedWebp = true;
               break;
             }
           }
         }
 
-        // ONLY Animated WebP requires owner whitelist!
-        if (isAnimatedWebp) {
-          const envList = (env.ANIMATED_WEBP_WHITELIST || '').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
-          const kvList = ((await kv.get('whitelist:animated_webp', { type: 'json' })) || []).map(s => s.toLowerCase().trim());
-          const whitelistSet = new Set(['officerpot10', ...envList, ...kvList]);
-
-          const playerUuid = uuid.toLowerCase();
-          const pName = playerName.toLowerCase().trim();
-
-          const isWhitelisted = whitelistSet.has(playerUuid) || whitelistSet.has(pName);
-
-          if (!isWhitelisted) {
-            return new Response(JSON.stringify({
-              error: 'Forbidden: Direct Animated WebP uploads are restricted to whitelisted accounts. You can still use GIF, static PNG, JPG, or static WebP!'
-            }), {
-              status: 403,
-              headers: corsHeaders,
-            });
-          }
+        if (isAnimatedWebp && !isWhitelisted) {
+          return new Response(JSON.stringify({
+            error: 'Forbidden: Direct Animated WebP uploads are restricted to whitelisted accounts. You can still use GIF, static PNG, JPG, or static WebP!'
+          }), {
+            status: 403,
+            headers: corsHeaders,
+          });
         }
       }
 
@@ -939,21 +1127,45 @@ export default {
         }
       }
 
-      // 2. Store binary file in edge KV cache (deduplicates identical capes across all players)
+      // 2. Store binary file in edge KV cache
       await kv.put(`file:${fileHash}`, bodyBuffer);
 
-      // 2.5 Track user capes (up to 30)
+      // 2.5 Track user capes (up to 30 for standard players)
       if (!userCapes.includes(fileHash)) {
         userCapes.push(fileHash);
         await kv.put(`user_capes:${uuid}`, JSON.stringify(userCapes));
       }
 
-      // 3. Store player mapping in KV
-      const allowCopy = request.headers.get('X-Cape-Allow-Copy') === 'true'; // default false
-      const friendsList = (request.headers.get('X-Cape-Friends') || '')
-        .split(',')
-        .map(s => s.trim().toLowerCase())
-        .filter(Boolean);
+      // 3. Merge or store privacy settings & player mapping in KV
+      const existingPrivacy = (await kv.get(`privacy:${uuid}`, { type: 'json' })) || {};
+      const hasAllowHeader = request.headers.get('X-Cape-Allow-Copy') !== null;
+      const hasFriendsHeader = request.headers.get('X-Cape-Friends') !== null;
+      const hasBlockedHeader = request.headers.get('X-Cape-Copy-Blocked') !== null;
+
+      const allowCopy = hasAllowHeader
+        ? (request.headers.get('X-Cape-Allow-Copy') === 'true')
+        : (existingPrivacy.allowCopy === true);
+
+      const friendsList = hasFriendsHeader
+        ? (request.headers.get('X-Cape-Friends') || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        : (Array.isArray(existingPrivacy.friends) ? existingPrivacy.friends : []);
+
+      const copyBlockedList = hasBlockedHeader
+        ? (request.headers.get('X-Cape-Copy-Blocked') || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        : (Array.isArray(existingPrivacy.copyBlocked) ? existingPrivacy.copyBlocked : []);
+
+      const updatedPrivacy = {
+        uuid,
+        playerName: playerName.toLowerCase().trim(),
+        allowCopy,
+        friends: friendsList,
+        copyBlocked: copyBlockedList,
+        updatedAt: Date.now(),
+      };
+      await kv.put(`privacy:${uuid}`, JSON.stringify(updatedPrivacy));
+      if (playerName && playerName !== 'Player') {
+        await kv.put(`privacy:${playerName.toLowerCase().trim()}`, JSON.stringify(updatedPrivacy));
+      }
 
       await kv.put(
         `player:${uuid}`,
@@ -963,6 +1175,7 @@ export default {
           fileName: fileName,
           allowCopy: allowCopy,
           friends: friendsList,
+          copyBlocked: copyBlockedList,
           updatedAt: Date.now(),
         })
       );
@@ -979,8 +1192,10 @@ export default {
       const currentCape = await kv.get(`player:${uuid}`, { type: 'json' });
       if (currentCape && currentCape.hash) {
         let userCapes = (await kv.get(`user_capes:${uuid}`, { type: 'json' })) || [];
-        userCapes = userCapes.filter(h => h !== currentCape.hash);
-        await kv.put(`user_capes:${uuid}`, JSON.stringify(userCapes));
+        if (Array.isArray(userCapes)) {
+          userCapes = userCapes.filter(h => h !== currentCape.hash);
+          await kv.put(`user_capes:${uuid}`, JSON.stringify(userCapes));
+        }
       }
       await kv.delete(`player:${uuid}`);
       return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });

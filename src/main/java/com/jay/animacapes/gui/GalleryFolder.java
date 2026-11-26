@@ -18,8 +18,8 @@ public class GalleryFolder {
     private static final java.util.Map<String, Boolean> APNG_CACHE = new java.util.concurrent.ConcurrentHashMap<>();
 
     public static boolean isBypassLimit() {
-        String key = AnimaCapesConfig.getInstance().adminKey;
-        return key != null && !key.trim().isEmpty();
+        return AnimaCapesConfig.getInstance().isAdmin()
+                || com.jay.animacapes.cloud.CloudCapeSync.getInstance().isWhitelistedAccount();
     }
 
     public static File getFolder() {

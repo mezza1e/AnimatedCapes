@@ -267,6 +267,7 @@ public class CapeShareService {
         String clean = targetPlayer.trim();
         boolean added = AnimaCapesConfig.getInstance().blockUser(clean);
         RemoteCapeManager.getInstance().purgePlayer(clean);
+        CloudCapeSync.getInstance().syncPrivacySettingsAsync();
 
         if (added) {
             if (callback != null) callback.accept("§e[Animated Capes] Blocked §f" + clean + "§e. You will no longer see their cape.");
@@ -286,6 +287,7 @@ public class CapeShareService {
 
         String clean = targetPlayer.trim();
         boolean removed = AnimaCapesConfig.getInstance().unblockUser(clean);
+        CloudCapeSync.getInstance().syncPrivacySettingsAsync();
 
         if (removed) {
             if (callback != null) callback.accept("§a[Animated Capes] Unblocked §f" + clean + "§a.");
